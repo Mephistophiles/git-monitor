@@ -1,0 +1,10 @@
+version = 1
+
+[smtp]
+host = "smtp.example.org"
+port = 587
+security = "starttls"
+username = "git-monitor@example.org"
+password_env = "GIT_MONITOR_SMTP_PASSWORD"
+from = "Git Monitor <git-monitor@example.org>"
+timeout = "30s"

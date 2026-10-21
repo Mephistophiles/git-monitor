@@ -1,0 +1,394 @@
+use crate::{
+    config::{duration, Execution, Function, Limits},
+    process::{self, Shutdown},
+};
+use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[derive(Clone)]
+pub struct Git {
+    pub path: PathBuf,
+    pub execution: Execution,
+    pub limits: Limits,
+    pub shutdown: Shutdown,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Changed {
+    pub path: String,
+    pub old_blob: Option<String>,
+    pub new_blob: Option<String>,
+    pub old_mode: String,
+    pub new_mode: String,
+}
+#[derive(Debug)]
+pub struct Selection {
+    pub bytes: Vec<u8>,
+    pub start: usize,
+}
+
+impl Git {
+    fn command(&self) -> Command {
+        let mut c = Command::new("git");
+        c.arg("--no-pager")
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(&self.path)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "diff.external=",
+                "-c",
+                "diff.renames=false",
+                "-c",
+                "color.ui=false",
+            ])
+            .env("LC_ALL", "C")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        c
+    }
+    pub fn raw(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let out = process::run(
+            self.command().args(args),
+            duration(&self.execution.git_timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        ensure!(
+            out.code == 0,
+            "Git operation failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(out.stdout)
+    }
+    pub fn text(&self, args: &[&str]) -> Result<String> {
+        String::from_utf8(self.raw(args)?).context("non-UTF-8 Git metadata is unsupported in v0.1")
+    }
+    pub fn init(&self) -> Result<()> {
+        if !self.path.exists() {
+            std::fs::create_dir_all(self.path.parent().context("repository parent")?)?;
+            let mut c = Command::new("git");
+            c.args(["init", "--bare", "--quiet"]).arg(&self.path);
+            let out = process::run(
+                &mut c,
+                duration(&self.execution.git_timeout)?,
+                65536,
+                &self.shutdown,
+                duration(&self.execution.shutdown_grace)?,
+                None,
+            )?;
+            ensure!(out.code == 0, "git init failed");
+        }
+        self.raw(&["config", "gc.auto", "0"])?;
+        self.raw(&["config", "maintenance.auto", "false"])?;
+        Ok(())
+    }
+    pub fn configure_remote(&self, remote: &str, url: &str) -> Result<()> {
+        self.raw(&["config", &format!("remote.{remote}.url"), url])?;
+        Ok(())
+    }
+    pub fn fetch(&self, remote: &str, bootstrap: bool) -> Result<()> {
+        let spec = format!("+refs/heads/*:refs/remotes/{remote}/*");
+        let mut c = self.command();
+        c.args([
+            "fetch",
+            "--atomic",
+            "--prune",
+            "--no-prune-tags",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-fetch-head",
+            "--porcelain",
+            "--refmap=",
+            remote,
+            &spec,
+        ]);
+        let timeout = if bootstrap {
+            &self.execution.bootstrap_timeout
+        } else {
+            &self.execution.git_timeout
+        };
+        let out = process::run(
+            &mut c,
+            duration(timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        // Remote stderr can contain credentials; never copy it into status or logs.
+        ensure!(
+            out.code == 0,
+            "fetch failed for {remote} (exit {}); check access and Git capabilities",
+            out.code
+        );
+        Ok(())
+    }
+    pub fn refs(&self, remote: &str) -> Result<BTreeMap<String, String>> {
+        let prefix = format!("refs/remotes/{remote}/");
+        let text = self.text(&["for-each-ref", "--format=%(refname) %(objectname)", &prefix])?;
+        let mut refs = BTreeMap::new();
+        for l in text.lines() {
+            let (name, oid) = l.split_once(' ').context("invalid ref record")?;
+            refs.insert(
+                name.strip_prefix(&prefix).context("ref namespace")?.into(),
+                oid.into(),
+            );
+        }
+        Ok(refs)
+    }
+    pub fn pin(&self, oid: &str) -> Result<()> {
+        self.raw(&["update-ref", &format!("refs/git-monitor/pins/{oid}"), oid])?;
+        Ok(())
+    }
+    pub fn ancestor(&self, a: &str, b: &str) -> Result<bool> {
+        let out = process::run(
+            self.command().args(["merge-base", "--is-ancestor", a, b]),
+            duration(&self.execution.git_timeout)?,
+            65536,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        ensure!(
+            out.code == 0 || out.code == 1,
+            "cannot inspect commit ancestry"
+        );
+        Ok(out.code == 0)
+    }
+    pub fn commits(&self, a: &str, b: &str) -> Result<Vec<String>> {
+        Ok(self
+            .text(&[
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                &format!("{a}..{b}"),
+            ])?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+    pub fn parent(&self, commit: &str) -> Result<Option<String>> {
+        Ok(self
+            .text(&["show", "-s", "--format=%P", commit])?
+            .split_whitespace()
+            .next()
+            .map(str::to_owned))
+    }
+    pub fn metadata(&self, oid: &str) -> Result<(String, String)> {
+        let b = self.raw(&["show", "-s", "--format=%s%x00%an", oid])?;
+        let separator = b
+            .iter()
+            .position(|x| *x == 0)
+            .context("invalid commit metadata")?;
+        let (subject, author) = (&b[..separator], &b[separator + 1..]);
+        Ok((
+            String::from_utf8_lossy(subject).into(),
+            String::from_utf8_lossy(author).trim().into(),
+        ))
+    }
+    pub fn changed(&self, old: Option<&str>, new: &str) -> Result<Vec<Changed>> {
+        let bytes = if let Some(a) = old {
+            self.raw(&[
+                "diff",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                a,
+                new,
+            ])?
+        } else {
+            self.raw(&[
+                "show",
+                "--format=",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                "--diff-merges=first-parent",
+                "--no-ext-diff",
+                "--no-textconv",
+                new,
+            ])?
+        };
+        let mut fields = bytes.split(|b| *b == 0).filter(|x| !x.is_empty());
+        let mut result = Vec::new();
+        while let Some(meta) = fields.next() {
+            let m = std::str::from_utf8(meta)?.trim_start_matches('\n');
+            ensure!(m.starts_with(':'), "invalid raw diff metadata");
+            let f: Vec<_> = m[1..].split_whitespace().collect();
+            ensure!(f.len() == 5, "invalid raw diff fields");
+            let path = String::from_utf8(fields.next().context("missing raw path")?.to_vec())
+                .context("non-UTF-8 paths are unsupported in v0.1")?;
+            let oid = |s: &str| {
+                if s.bytes().all(|x| x == b'0') {
+                    None
+                } else {
+                    Some(s.to_owned())
+                }
+            };
+            result.push(Changed {
+                path,
+                old_blob: oid(f[2]),
+                new_blob: oid(f[3]),
+                old_mode: f[0].into(),
+                new_mode: f[1].into(),
+            });
+        }
+        Ok(result)
+    }
+    pub fn show_patch(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
+        self.raw(&[
+            "show",
+            "--format=",
+            "--patch",
+            "--no-color",
+            "--no-renames",
+            "--diff-merges=first-parent",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--diff-algorithm=histogram",
+            "--unified=3",
+            commit,
+            "--",
+            path,
+        ])
+    }
+    pub fn blob(&self, oid: Option<&str>) -> Result<Vec<u8>> {
+        let Some(oid) = oid else {
+            return Ok(vec![]);
+        };
+        let size: usize = self.text(&["cat-file", "-s", oid])?.trim().parse()?;
+        ensure!(
+            size <= self.limits.max_blob_bytes,
+            "blob budget exceeded ({size} bytes)"
+        );
+        self.raw(&["cat-file", "blob", oid])
+    }
+    pub fn tree(&self, rev: &str) -> Result<String> {
+        Ok(self
+            .text(&["rev-parse", &format!("{rev}^{{tree}}")])?
+            .trim()
+            .into())
+    }
+    pub fn tree_blob(&self, rev: &str, path: &str) -> Result<Option<String>> {
+        let spec = format!("{rev}:{path}");
+        let out = process::run(
+            self.command().args(["rev-parse", "--verify", &spec]),
+            duration(&self.execution.git_timeout)?,
+            65536,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        Ok((out.code == 0).then(|| String::from_utf8_lossy(&out.stdout).trim().into()))
+    }
+    pub fn select(&self, rev: Option<&str>, f: &Function) -> Result<Option<Selection>> {
+        let Some(rev) = rev else {
+            return Ok(None);
+        };
+        let Some(oid) = self.tree_blob(rev, &f.path)? else {
+            return Ok(None);
+        };
+        let bytes = self.blob(Some(&oid))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let tree = self.tree(rev)?;
+        let mut c = self.command();
+        c.env("GIT_AUTHOR_NAME", "Git Monitor")
+            .env("GIT_AUTHOR_EMAIL", "git-monitor@localhost")
+            .env("GIT_COMMITTER_NAME", "Git Monitor")
+            .env("GIT_COMMITTER_EMAIL", "git-monitor@localhost")
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
+        c.args(["commit-tree", &tree, "-m", "git-monitor snapshot"]);
+        let out = process::run(
+            &mut c,
+            duration(&self.execution.git_timeout)?,
+            65536,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        ensure!(out.code == 0, "cannot create range snapshot");
+        let root = String::from_utf8(out.stdout)?.trim().to_owned();
+        self.pin(&root)?;
+        let selector = format!(":{}:{}", f.expression, f.path);
+        let mut c = self.command();
+        c.env("GIT_ATTR_SOURCE", rev).args([
+            "log",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-L",
+            &selector,
+            &root,
+        ]);
+        let out = process::run(
+            &mut c,
+            duration(&self.execution.git_timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        if out.code != 0 {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("no match") && err.contains("-L parameter") {
+                return Ok(None);
+            }
+            bail!("function selector failed: {}", err.trim());
+        }
+        let patch = String::from_utf8_lossy(&out.stdout);
+        let header = patch
+            .lines()
+            .find(|l| l.starts_with("@@ "))
+            .context("range has no hunk")?;
+        let token = header
+            .split_whitespace()
+            .nth(2)
+            .context("range coordinates")?;
+        let (start, count) = token
+            .trim_start_matches('+')
+            .split_once(',')
+            .unwrap_or((token.trim_start_matches('+'), "1"));
+        let start: usize = start.parse()?;
+        let count: usize = count.parse()?;
+        let mut offset = 0;
+        let mut lines = Vec::new();
+        for l in bytes.split_inclusive(|x| *x == b'\n') {
+            lines.push((offset, offset + l.len()));
+            offset += l.len();
+        }
+        ensure!(
+            start > 0 && start - 1 + count <= lines.len(),
+            "range outside blob"
+        );
+        let begin = lines[start - 1].0;
+        let end = lines[start - 1 + count - 1].1;
+        Ok(Some(Selection {
+            bytes: bytes[begin..end].to_vec(),
+            start,
+        }))
+    }
+}
+
+pub fn repository_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.git"))
+}

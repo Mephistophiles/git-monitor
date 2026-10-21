@@ -1,0 +1,4 @@
+/target/
+/var/
+*.sqlite3*
+/examples/demo-work/
