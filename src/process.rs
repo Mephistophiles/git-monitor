@@ -49,6 +49,21 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
+#[cfg(unix)]
+fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn nonblocking<T>(_: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn run(
     command: &mut Command,
     timeout: Duration,
@@ -115,21 +130,59 @@ fn run_inner(
         bail!("worker address-space limit is unsupported on this platform");
     }
     let mut child = command.spawn().context("start child process")?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    nonblocking(&stdout)?;
+    nonblocking(&stderr)?;
+    if let Some(stdin) = &child.stdin {
+        nonblocking(stdin)?;
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
     let writer = input.map(|bytes| {
         let mut stdin = child.stdin.take().unwrap();
-        std::thread::spawn(move || stdin.write_all(&bytes))
+        let cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            let mut remaining = bytes.as_slice();
+            while !remaining.is_empty() {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                match stdin.write(remaining) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => remaining = &remaining[n..],
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })
     });
     let exceeded = Arc::new(AtomicBool::new(false));
     fn reader<R: Read + Send + 'static>(
         mut r: R,
         cap: usize,
         exceeded: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             let mut buffer = [0; 8192];
             loop {
-                let n = r.read(&mut buffer)?;
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = match r.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
                 if n == 0 {
                     break;
                 }
@@ -142,13 +195,24 @@ fn run_inner(
             Ok(bytes)
         })
     }
-    let out = reader(child.stdout.take().unwrap(), limit, exceeded.clone());
-    let err = reader(child.stderr.take().unwrap(), 65536, exceeded.clone());
+    let out = reader(stdout, limit, exceeded.clone(), cancelled.clone());
+    let err = reader(stderr, 65536, exceeded.clone(), cancelled.clone());
     let start = Instant::now();
     let mut failure = None;
+    let mut exited = None;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if exited.is_none() {
+            exited = child.try_wait()?;
+        }
+        // A transport/helper can outlive its parent while holding a pipe open.
+        // Keep enforcing deadlines until every I/O thread has finished too.
+        if let Some(status) = exited {
+            if out.is_finished()
+                && err.is_finished()
+                && writer.as_ref().is_none_or(|w| w.is_finished())
+            {
+                break status;
+            }
         }
         if exceeded.load(Ordering::Relaxed) || start.elapsed() > timeout || shutdown.expired(grace)
         {
@@ -166,6 +230,7 @@ fn run_inner(
                 }
             }
             let _ = child.kill();
+            cancelled.store(true, Ordering::Relaxed);
             break child.wait()?;
         }
         std::thread::sleep(Duration::from_millis(20));

@@ -212,15 +212,6 @@ impl Watch {
             .is_none_or(|ps| globs(ps).is_ok_and(|g| g.is_match(path)))
             && !globs(&self.exclude_paths).is_ok_and(|g| g.is_match(path))
     }
-    pub fn allows_old(&self, old: &Self) -> bool {
-        self.function == old.function
-            && self.exclude_paths == old.exclude_paths
-            && match (&self.paths, &old.paths) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(a), Some(b)) => b.iter().all(|x| a.contains(x)),
-            }
-    }
     pub fn selector_key(&self) -> String {
         let mut w = self.clone();
         w.id.clear();

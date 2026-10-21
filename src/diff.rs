@@ -262,6 +262,7 @@ fn syntax(
         let mut stack = vec![tree.root_node()];
         let mut count = 0;
         let mut tokens = vec![];
+        let mut structure = Vec::new();
         let mut hashes = BTreeSet::new();
         while let Some(node) = stack.pop() {
             count += 1;
@@ -271,6 +272,14 @@ fn syntax(
             if node.kind().contains("comment") {
                 continue;
             }
+            // Preorder node kinds plus significant child counts encode the
+            // tree shape without byte offsets or comments. Leaf tokens alone
+            // cannot distinguish Python indentation/control-flow changes.
+            let children = (0..node.child_count())
+                .filter_map(|i| node.child(i))
+                .filter(|child| !child.kind().contains("comment"))
+                .count();
+            structure.push((node.kind_id(), children));
             if node.child_count() == 0 {
                 tokens.push(format!(
                     "{}:{}",
@@ -288,7 +297,7 @@ fn syntax(
                 }
             }
         }
-        sides.push((tokens, hashes));
+        sides.push((tokens, hashes, structure));
     }
     if sides[0].0.len().saturating_mul(sides[1].0.len()) > limits.max_syntax_candidates {
         return Err("syntax_budget_exceeded".into());
@@ -314,7 +323,7 @@ fn syntax(
             unchanged_subtrees: sides[0].1.intersection(&sides[1].1).count(),
             deleted_tokens: deleted,
             inserted_tokens: inserted,
-            text_only_change: a == b && old != new,
+            text_only_change: a == b && sides[0].2 == sides[1].2 && old != new,
         },
         name.into(),
     ))

@@ -82,6 +82,10 @@ pub struct Task {
     pub path: PathBuf,
     pub event: EventView,
     pub watch: Watch,
+    /// Restrict the first transition after a selector change to continuous scope.
+    /// Older persisted jobs already carry their complete selector in `watch`.
+    #[serde(default)]
+    pub previous_watch: Option<Watch>,
     pub execution: Execution,
     pub limits: Limits,
     pub diff: DiffConfig,
@@ -249,9 +253,9 @@ impl Store {
                 let Some(previous) = a.previous.get(&w.id) else {
                     continue;
                 };
-                // An expanded selector analyzes its existing scope for this first transition;
-                // newly selected content starts at the just-fetched snapshot.
-                if !previous.branch_matches(&event.branch) || !w.allows_old(previous) {
+                // Evaluate the intersection on actual paths, rather than trying to
+                // infer containment from glob strings. Function changes rebaseline.
+                if !previous.branch_matches(&event.branch) || w.function != previous.function {
                     continue;
                 }
                 let requested = if event.kind == "branch_updated" {
@@ -262,14 +266,13 @@ impl Store {
                 if !w.events.iter().any(|x| x == requested) {
                     continue;
                 }
-                let mut scope = previous.clone();
-                scope.recipients = w.recipients.clone();
-                scope.events = w.events.clone();
                 let task = Task {
                     source_key: a.key.clone(),
                     path: a.path.clone(),
                     event: event.clone(),
-                    watch: scope,
+                    watch: w.clone(),
+                    previous_watch: (w.selector_key() != previous.selector_key())
+                        .then(|| previous.clone()),
                     execution: a.execution.clone(),
                     limits: a.limits.clone(),
                     diff: a.diff.clone(),
@@ -387,6 +390,7 @@ impl Store {
         recipient: &str,
         pending_only: bool,
         budget: usize,
+        mut include: impl FnMut(&PendingMatch) -> Result<bool>,
     ) -> Result<Vec<PendingMatch>> {
         let order = if pending_only { "ASC" } else { "DESC" };
         let mut q = self.db.prepare(&format!("SELECT m.id,m.source_key,m.watch,m.body,e.body FROM matches m JOIN events e ON e.id=m.event_id WHERE m.recipient=? AND (?=0 OR m.digest IS NULL) AND coalesce(m.digest,'')<>'revoked' ORDER BY m.event_id {order},m.id {order}"))?;
@@ -394,6 +398,17 @@ impl Store {
         let mut used = 0usize;
         let mut results: Vec<PendingMatch> = Vec::new();
         while let Some(row) = rows.next()? {
+            // Reconcile subscriptions before charging the content budget. A
+            // revoked row must not prevent eligible rows later in the queue.
+            let mut candidate = PendingMatch {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                watch: serde_json::from_str(&row.get::<_, String>(2)?)?,
+                event: serde_json::from_str(&row.get::<_, String>(4)?)?,
+            };
+            if !include(&candidate)? {
+                continue;
+            }
             let body: String = row.get(3)?;
             if !results.is_empty() && used.saturating_add(body.len()) > budget {
                 results.last_mut().unwrap().event.notes.push("Report window limited by byte budget; further changes remain in SQLite for a later digest or a larger preview budget.".into());
@@ -406,17 +421,12 @@ impl Store {
             } else {
                 serde_json::from_str(&body)?
             };
-            let watch: Watch = serde_json::from_str(&row.get::<_, String>(2)?)?;
             if event.watches.is_empty() {
-                event.watches.push(watch.id.clone());
+                event.watches.push(candidate.watch.id.clone());
             }
             used = used.saturating_add(body.len());
-            results.push(PendingMatch {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                watch,
-                event,
-            });
+            candidate.event = event;
+            results.push(candidate);
             if used >= budget {
                 break;
             }

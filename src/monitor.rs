@@ -179,7 +179,13 @@ fn selected(
             files.push(fd);
         }
     } else {
-        for change in changes.iter().filter(|f| w.path_matches(&f.path)) {
+        for change in changes.iter().filter(|f| {
+            w.path_matches(&f.path)
+                && task
+                    .previous_watch
+                    .as_ref()
+                    .is_none_or(|previous| previous.path_matches(&f.path))
+        }) {
             if change.old_mode == "160000" || change.new_mode == "160000" {
                 let mut f = FileDiff::diagnostic(
                     &change.path,
@@ -494,6 +500,7 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
             &task.event.new,
             &task.event.kind,
             task.watch.selector_key(),
+            task.previous_watch.as_ref().map(Watch::selector_key),
             &task.diff,
             &task.limits,
         ))?);
@@ -593,17 +600,28 @@ pub fn report(
     ensure!(cfg.recipients.contains_key(recipient), "unknown recipient");
     let mut ids = vec![];
     let mut events: BTreeMap<i64, EventView> = BTreeMap::new();
-    for m in store.matches(recipient, pending_only, cfg.limits.max_job_output_bytes)? {
-        let Some(w) = allowed(cfg, &m.watch, &m.event, &m.key) else {
-            store.db.execute(
-                "UPDATE matches SET digest='revoked' WHERE id=? AND digest IS NULL",
-                [m.id],
-            )?;
-            continue;
-        };
-        if !w.recipients.iter().any(|r| r == recipient) {
-            continue;
-        }
+    let mut scopes = BTreeMap::new();
+    let matches = store.matches(
+        recipient,
+        pending_only,
+        cfg.limits.max_job_output_bytes,
+        |m| {
+            if let Some(w) = allowed(cfg, &m.watch, &m.event, &m.key)
+                .filter(|w| w.recipients.iter().any(|r| r == recipient))
+            {
+                scopes.insert(m.id, w);
+                Ok(true)
+            } else {
+                store.db.execute(
+                    "UPDATE matches SET digest='revoked' WHERE id=? AND digest IS NULL",
+                    [m.id],
+                )?;
+                Ok(false)
+            }
+        },
+    )?;
+    for m in matches {
+        let w = &scopes[&m.id];
         let mut e = m.event;
         for c in &mut e.commits {
             c.files.retain(|f| w.path_matches(&f.path));

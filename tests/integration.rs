@@ -882,6 +882,465 @@ fn additive_expansion_keeps_pending_matches() {
 }
 
 #[test]
+fn continuously_selected_paths_survive_filter_changes() {
+    let original = "paths = ['**/*.c', '*.c']";
+    for (before, after) in [
+        (original, "paths = ['test.c']"),
+        ("", "paths = ['test.c']"),
+        (original, "paths = ['*.c']\nexclude_paths = ['excluded.c']"),
+        ("paths = ['test.c']", "paths = ['*.c']"),
+        ("paths = ['test.c']", ""),
+    ] {
+        let f = Fixture::new(false);
+        let text = std::fs::read_to_string(&f.config).unwrap();
+        let baseline = text.replace(original, before);
+        std::fs::write(&f.config, &baseline).unwrap();
+        f.ok();
+        std::fs::write(f.work.join("excluded.c"), "int excluded = 1;\n").unwrap();
+        f.change(
+            &BEFORE.replace("value > 0", "value >= 0"),
+            "Continuous change",
+        );
+        std::fs::write(&f.config, text.replace(original, after)).unwrap();
+        // Persist the transition before worker execution (also exercises restart).
+        let cfg = Config::load(&f.config).unwrap();
+        let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+        let jobs = store.jobs().unwrap();
+        assert_eq!(jobs.len(), 1, "{before:?} -> {after:?}");
+        assert!(jobs[0].1.previous_watch.is_some());
+        drop(store);
+        f.ok();
+        assert!(f.report().contains("Continuous change"));
+        let body: String = f
+            .db()
+            .query_row("SELECT body FROM matches", [], |r| r.get(0))
+            .unwrap();
+        let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = event
+            .commits
+            .iter()
+            .flat_map(|c| &c.files)
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, ["test.c"], "{before:?} -> {after:?}");
+        f.ok();
+        assert_eq!(f.count("matches"), 1, "no replay on next poll");
+    }
+}
+
+#[test]
+fn expanded_scope_is_baselined_and_cache_respects_previous_scope() {
+    let f = Fixture::new(false);
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    let second = text
+        .split("[[watches]]")
+        .nth(1)
+        .unwrap()
+        .replace("id='runtime'", "id='rust'")
+        .replace("paths = ['**/*.c', '*.c']", "paths = ['*.rs']");
+    let text = format!("{text}\n[[watches]]{second}");
+    std::fs::write(&f.config, &text).unwrap();
+    f.ok();
+    std::fs::write(f.work.join("new.rs"), "fn added() {}\n").unwrap();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Both languages");
+    let expanded = text
+        .replace("paths = ['**/*.c', '*.c']", "")
+        .replace("paths = ['*.rs']", "");
+    std::fs::write(&f.config, expanded).unwrap();
+    let output = f.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=2"));
+    let db = f.db();
+    for (watch, expected) in [("runtime", "test.c"), ("rust", "new.rs")] {
+        let body: String = db
+            .query_row("SELECT body FROM matches WHERE watch_id=?", [watch], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = event
+            .commits
+            .iter()
+            .flat_map(|c| &c.files)
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, [expected]);
+    }
+    std::fs::write(
+        f.work.join("new.rs"),
+        "fn added() { println!(\"now tracked\"); }\n",
+    )
+    .unwrap();
+    f.change(&BEFORE.replace("value > 0", "value > 2"), "After baseline");
+    let output = f.run();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=1"));
+    let body: String = db
+        .query_row(
+            "SELECT body FROM matches WHERE watch_id='runtime' ORDER BY event_id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert_eq!(event.commits[0].files.len(), 2);
+    // Pre-upgrade tasks still deserialize without the new optional restriction.
+    let task: String = db
+        .query_row("SELECT task FROM jobs LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let mut task: serde_json::Value = serde_json::from_str(&task).unwrap();
+    task.as_object_mut().unwrap().remove("previous_watch");
+    assert!(serde_json::from_value::<git_monitor::store::Task>(task)
+        .unwrap()
+        .previous_watch
+        .is_none());
+}
+
+#[test]
+fn revoked_subscriptions_do_not_consume_the_pending_report_budget() {
+    for remove_watch in [false, true] {
+        let f = Fixture::new(false);
+        let text = std::fs::read_to_string(&f.config).unwrap();
+        let extra = text
+            .split("[[watches]]")
+            .nth(1)
+            .unwrap()
+            .replace("id='runtime'", "id='second'");
+        let text = text.replace(
+            "[recipients.alice]",
+            "[recipients.bob]\nto=['bob@example.invalid']\n[recipients.alice]",
+        );
+        std::fs::write(&f.config, format!("{text}\n[[watches]]{extra}")).unwrap();
+        f.ok();
+        f.change(
+            &BEFORE.replace("value > 0", "value >= 0"),
+            "Still owed to Alice",
+        );
+        f.ok();
+        let mut cfg = Config::load(&f.config).unwrap();
+        if remove_watch {
+            cfg.watches.remove(0);
+        } else {
+            cfg.watches[0].recipients = vec!["bob".into()];
+        }
+        let len: usize = f
+            .db()
+            .query_row(
+                "SELECT length(body) FROM matches ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cfg.limits.max_job_output_bytes = len + 100;
+        let store = Store::open(&cfg.storage.state_dir).unwrap();
+        let (report, ids) = git_monitor::monitor::report(&cfg, &store, "alice", true).unwrap();
+        assert_eq!(
+            report.events.len(),
+            1,
+            "eligible row must fit in this same call"
+        );
+        assert_eq!(report.events[0].watches, ["second"]);
+        assert_eq!(ids.len(), 1);
+        let revoked: i64 = store
+            .db
+            .query_row(
+                "SELECT count(*) FROM matches WHERE digest='revoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked, 1);
+        store
+            .db
+            .execute(
+                "UPDATE matches SET digest='test-delivered' WHERE id=?",
+                [ids[0]],
+            )
+            .unwrap();
+        assert!(git_monitor::monitor::report(&cfg, &store, "alice", true)
+            .unwrap()
+            .0
+            .events
+            .is_empty());
+    }
+}
+
+#[test]
+fn cli_retries_failed_analysis_and_exports_the_recovered_report() {
+    let f = Fixture::new(false);
+    let cli = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("--config")
+            .arg(&f.config)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for action in ["check-config", "doctor"] {
+        assert!(cli(&[action]).status.success());
+    }
+    f.ok();
+    let original = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        format!("{original}\n[limits]\nmax_job_output_bytes=100\n"),
+    )
+    .unwrap();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Recovered analysis",
+    );
+    f.ok();
+    let (id, state): (i64, String) = f
+        .db()
+        .query_row("SELECT id,state FROM jobs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(f.count("cache"), 0, "failures cannot poison shared cache");
+    let status = cli(&["status"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("failed jobs  1"));
+    assert!(!cli(&["retry-analysis", "--job", "99999"]).status.success());
+    std::fs::write(&f.config, original).unwrap();
+    assert!(cli(&["retry-analysis", "--job", &id.to_string()])
+        .status
+        .success());
+    let output = f.root.join("exports");
+    assert!(cli(&[
+        "run",
+        "--once",
+        "--force",
+        "--output-dir",
+        output.to_str().unwrap()
+    ])
+    .status
+    .success());
+    assert!(std::fs::read_to_string(output.join("alice.html"))
+        .unwrap()
+        .contains("Recovered analysis"));
+    let preview = f.root.join("preview.html");
+    assert!(cli(&[
+        "preview",
+        "--recipient",
+        "alice",
+        "--output",
+        preview.to_str().unwrap()
+    ])
+    .status
+    .success());
+    assert!(std::fs::read_to_string(preview)
+        .unwrap()
+        .contains("Recovered analysis"));
+    let state: String = f
+        .db()
+        .query_row("SELECT state FROM jobs WHERE id=?", [id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "done");
+}
+
+#[test]
+fn ordinary_poll_respects_interval_and_failure_backoff() {
+    let f = Fixture::new(false);
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    cfg.defaults.poll_every = "1h".into();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let key = source_key("project", "origin", f.remote.to_str().unwrap());
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "After interval");
+    store
+        .db
+        .execute(
+            "UPDATE remote_status SET next_poll=?",
+            [git_monitor::now() + 100],
+        )
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), false)
+            .unwrap()
+            .0,
+        0
+    );
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), false)
+            .unwrap()
+            .0,
+        0
+    );
+    store.fetch_error(&key).unwrap();
+    assert!(store.next_poll(&key).unwrap() > git_monitor::now());
+    assert!(store.status().unwrap().contains("failures=1"));
+    store
+        .db
+        .execute("UPDATE snapshots SET checked=0", [])
+        .unwrap();
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), false)
+            .unwrap()
+            .0,
+        1
+    );
+    assert!(store.status().unwrap().contains("failures=0"));
+}
+
+#[test]
+fn report_budget_preserves_later_pending_matches_and_marks_oversized_items() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "First pending");
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 1"), "Second pending");
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    let len: usize = f
+        .db()
+        .query_row(
+            "SELECT length(body) FROM matches ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    cfg.limits.max_job_output_bytes = len + 1;
+    let store = Store::open(&cfg.storage.state_dir).unwrap();
+    let (report, ids) = git_monitor::monitor::report(&cfg, &store, "alice", true).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(report.events[0].commits[0].subject, "First pending");
+    assert!(report.events[0]
+        .notes
+        .iter()
+        .any(|n| n.contains("window limited")));
+    store
+        .db
+        .execute(
+            "UPDATE matches SET digest='test-delivered' WHERE id=?",
+            [ids[0]],
+        )
+        .unwrap();
+    cfg.limits.max_job_output_bytes = 1;
+    let (report, ids) = git_monitor::monitor::report(&cfg, &store, "alice", true).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert!(report.events[0]
+        .notes
+        .iter()
+        .any(|n| n.contains("oversized_item")));
+    assert!(report.events[0].commits.is_empty());
+    assert_eq!(report.events[0].watches, ["runtime"]);
+    cfg.limits.max_job_output_bytes = 128_000_000;
+    let (report, _) = git_monitor::monitor::report(&cfg, &store, "alice", true).unwrap();
+    assert_eq!(report.events[0].commits[0].subject, "Second pending");
+}
+
+fn offline_mail() -> git_monitor::mail::MailConfig {
+    git_monitor::mail::MailConfig {
+        version: 1,
+        smtp: git_monitor::mail::Smtp {
+            host: "localhost".into(),
+            port: 2525,
+            security: "none".into(),
+            username: None,
+            password: None,
+            password_env: None,
+            from: "Git Monitor <test@example.invalid>".into(),
+            timeout: "1s".into(),
+        },
+    }
+}
+
+#[test]
+fn prepared_outbox_is_rebuilt_for_changed_addresses() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Queued digest");
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let mail = offline_mail();
+    let shutdown = Shutdown::default();
+    assert_eq!(
+        git_monitor::monitor::outputs(&cfg, &mut store, Some(&mail), &shutdown, None).unwrap(),
+        1
+    );
+    cfg.recipients.get_mut("alice").unwrap().to = vec!["new@example.invalid".into()];
+    assert_eq!(
+        git_monitor::monitor::outputs(&cfg, &mut store, Some(&mail), &shutdown, None).unwrap(),
+        1
+    );
+    let revoked: i64 = store
+        .db
+        .query_row(
+            "SELECT count(*) FROM deliveries WHERE state='revoked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revoked, 1);
+    let mime: Vec<u8> = store
+        .db
+        .query_row(
+            "SELECT mime FROM deliveries WHERE state='pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mime = String::from_utf8(mime).unwrap();
+    assert!(mime.contains("To: new@example.invalid"));
+    assert!(!mime.contains("To: alice@example.invalid"));
+}
+
+#[test]
+fn binary_mode_and_gitlink_changes_have_explicit_kinds() {
+    let f = Fixture::new(false);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace("paths = ['**/*.c', '*.c']", "");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    std::fs::write(f.work.join("binary.dat"), b"binary\0data").unwrap();
+    git(&f.work, &["add", "."]);
+    git(&f.work, &["update-index", "--chmod=+x", "test.c"]);
+    let oid = git(&f.work, &["rev-parse", "HEAD"]);
+    git(
+        &f.work,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{oid},submodule"),
+        ],
+    );
+    git(&f.work, &["commit", "-qm", "Metadata changes"]);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    let kinds: std::collections::BTreeMap<_, _> = event.commits[0]
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.kind.as_str()))
+        .collect();
+    assert_eq!(kinds["binary.dat"], "binary");
+    assert_eq!(kinds["test.c"], "mode_changed");
+    assert_eq!(kinds["submodule"], "gitlink");
+}
+
+#[test]
 fn html_escapes_untrusted_text_and_preserves_export() {
     let f = Fixture::new(false);
     f.ok();
@@ -1241,17 +1700,23 @@ fn smtp_retry_reuses_saved_mime_and_message_id() {
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_then_terminates_fetch_process_group() {
-    check_fetch_shutdown(false);
+    check_fetch_shutdown(false, false);
 }
 
 #[cfg(unix)]
 #[test]
 fn sigterm_preserves_unpublished_selected_branch_attempt() {
-    check_fetch_shutdown(true);
+    check_fetch_shutdown(true, false);
 }
 
 #[cfg(unix)]
-fn check_fetch_shutdown(selected: bool) {
+#[test]
+fn sigterm_terminates_pipe_holders_after_fetch_parent_exits() {
+    check_fetch_shutdown(false, true);
+}
+
+#[cfg(unix)]
+fn check_fetch_shutdown(selected: bool, orphan: bool) {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new(false);
     if selected {
@@ -1274,7 +1739,22 @@ fn check_fetch_shutdown(selected: bool) {
     )
     .unwrap();
     let wrapper = bin.join("git");
-    std::fs::write(&wrapper,format!("#!/bin/sh\ncase \" $* \" in *' fetch '*) touch '{}'; sleep 30;; esac\nexec '{}' \"$@\"\n",marker.display(),actual.trim())).unwrap();
+    let stall = if orphan {
+        format!(
+            "(sleep 0.2; touch '{}'; sleep 30) & exit 0",
+            marker.display()
+        )
+    } else {
+        format!("touch '{}'; sleep 30", marker.display())
+    };
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *' fetch '*) {stall};; esac\nexec '{}' \"$@\"\n",
+            actual.trim()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(BIN)
         .args([
