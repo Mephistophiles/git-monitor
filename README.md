@@ -141,12 +141,16 @@ This first structural engine is a foundation, **not full difftastic parity**. A 
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets --locked
+rustup component add llvm-tools-preview
+python3 scripts/coverage.py
 cargo build --release --locked
 cargo bench --bench baseline -- --save-baseline my-run
 python3 scripts/record-baseline.py --name my-run
 ```
 
 Integration tests create local Git repositories and a local SMTP fixture. They cover bootstrap/no-op behavior, multiple remotes, shared analysis, force-push/rollback, crash recovery, branch deletion, function scope, deletion/restoration, attributes, merge resolution, MIME limits, durable SMTP retries, hostile HTML, and bounded SIGTERM shutdown. Selected-branch cases additionally check excluded orphan objects, combined watches, coverage changes, empty observations, discovery/download races, incomplete staging, and atomic publication conflicts.
+
+CI measures coverage across tests and spawned CLI/analysis/SMTP workers. It requires at least 90% source line coverage, 90% function coverage, 85% region coverage, and 85% line coverage in each source file. The HTML and JSON reports are uploaded as the `source-coverage` artifact; locally they are written under `target/coverage`. See [coverage results and regression scenarios](docs/coverage.md). Region coverage is not branch coverage.
 
 Criterion includes native text/syntax comparisons and an incremental **fetch → analysis → HTML → MIME** pass using local transport and `--prepare-only`. Fixture creation and the initial baseline fetch are outside that measurement. [benchmarks/baselines](benchmarks/baselines) records initial results and their environment; these are observations from one host, not performance guarantees.
 
