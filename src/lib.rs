@@ -1,6 +1,7 @@
 pub mod config;
 pub mod diff;
 pub mod doctor;
+pub mod document;
 pub mod git;
 pub mod mail;
 pub mod maintenance;

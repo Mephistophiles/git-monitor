@@ -268,6 +268,7 @@ impl Watch {
             p.dedup();
         }
         w.exclude_paths.sort();
+        w.exclude_paths.dedup();
         crate::hash(serde_json::to_vec(&w).expect("watch serialization"))
     }
 }

@@ -1,4 +1,9 @@
 /target/
+*.profraw
+*.profdata
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 /var/
 *.sqlite3*
 /examples/demo-work/

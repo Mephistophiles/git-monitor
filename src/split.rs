@@ -64,6 +64,8 @@ fn rows(values: &[Row]) -> (Vec<Row>, Vec<Row>) {
 
 pub fn begin(file: &FileDiff) -> FileDiff {
     let mut f = file.clone();
+    f.document = None;
+    f.canonical_patch = None;
     let old = STANDARD.decode(&f.old_bytes).unwrap_or_default();
     let new = STANDARD.decode(&f.new_bytes).unwrap_or_default();
     f.continuation = Some(Continuation {

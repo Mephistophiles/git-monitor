@@ -131,6 +131,15 @@ State databases upgrade automatically to schema 3, including durable source epoc
 
 ## Diff engine
 
+Published textual results carry a versioned byte-oriented `DiffDocument` with
+selected source ranges, hashes and ordered edits. Publication validates that
+edits reconstruct the complete allowed new bytes and stay within the selected
+scope. Whole-file reports export the canonical Git patch; function reports
+export a scoped JSON model rather than an applicable whole-file patch. Both
+file and function presentation use Git histogram with the configured context.
+Line pairing uses bounded token similarity, intraline edits preserve Unicode
+graphemes, and equal moved blocks share one deterministic move identifier.
+
 The application owns its typed diff model, HTML, CSS, and interaction code. Git supplies canonical file patches; native code handles line pairing, intraline highlighting, original coordinates, basic moved-line annotation, themes, copying, and exact byte exports. Selected function snippets use a bounded native line diff.
 
 `mode = "auto"` additionally parses supported languages with Tree-sitter and compares significant token sequences and identical subtrees. The report shows unchanged subtree counts and changed token counts, and identifies formatting/comment-only changes. Parse errors, unsupported languages, and syntax budgets fall back explicitly to text. `mode = "text"` disables structural analysis; `"syntax"` requests it with the same explicit fallback.
@@ -148,6 +157,15 @@ python3 scripts/coverage.py
 cargo build --release --locked
 cargo bench --bench baseline -- --save-baseline my-run
 python3 scripts/record-baseline.py --name my-run
+```
+
+Property tests exercise byte reconstruction, scope validation and selector set
+canonicalization. The fuzz target covers patch parsing, the byte document,
+HTML escaping and continuation splitting:
+
+```sh
+cargo check --manifest-path fuzz/Cargo.toml --locked
+cargo +nightly fuzz run invariants -- -max_total_time=60
 ```
 
 Integration tests create local Git repositories and a local SMTP fixture. They cover bootstrap/no-op behavior, multiple remotes, shared analysis, force-push/rollback, crash recovery, branch deletion, function scope, deletion/restoration, attributes, merge resolution, MIME limits, durable SMTP retries, hostile HTML, and bounded SIGTERM shutdown. Selected-branch cases additionally check excluded orphan objects, combined watches, coverage changes, empty observations, discovery/download races, incomplete staging, and atomic publication conflicts.
@@ -185,6 +203,6 @@ an earlier context, establish a fresh epoch and baseline. `doctor` performs
 offline capability probes, storage write checks, worker-limit and queue-integrity
 checks without contacting configured remotes or SMTP.
 
-This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
+This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file and function patches use Git histogram. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
 
 Licensed under [MIT](LICENSE).

@@ -424,6 +424,13 @@ impl Store {
         error: Option<&str>,
         cfg: &Config,
     ) -> Result<()> {
+        for file in result
+            .files
+            .iter()
+            .chain(result.commits.iter().flat_map(|c| &c.files))
+        {
+            file.validate()?;
+        }
         let mut event = task.event.clone();
         event.watches = vec![task.watch.id.clone()];
         event.commits = result.commits.clone();

@@ -1594,6 +1594,33 @@ fn configured_file_context_is_respected() {
 }
 
 #[test]
+fn function_document_has_exact_original_scope_and_no_whole_file_patch() {
+    let f = Fixture::new(true);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace("match = 'target'", "match = 'PRIVATE_NEIGHBOR'");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    f.change(
+        &BEFORE.replace("return 900", "return 901"),
+        "Second function scope",
+    );
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    let file = &event.commits[0].files[0];
+    file.validate().unwrap();
+    let doc = file.document.as_ref().unwrap();
+    assert!(doc.old.original_range.start > 0);
+    assert!(doc.old.start_line > 1);
+    assert!(doc.old.blob.is_some());
+    assert!(file.canonical_patch.is_none());
+}
+
+#[test]
 fn maintenance_keeps_pending_results_and_gc_preserves_queued_objects() {
     let f = Fixture::new(false);
     f.ok();

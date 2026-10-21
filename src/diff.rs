@@ -17,27 +17,91 @@ fn span(text: &str, changed: bool) -> Vec<Span> {
     }]
 }
 fn inline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
-    let diff = TextDiff::configure()
-        .timeout(std::time::Duration::from_millis(100))
-        .diff_chars(old, new);
-    let (mut left, mut right) = (vec![], vec![]);
-    for c in diff.iter_all_changes() {
-        if c.tag() != ChangeTag::Insert {
-            left.push(Span {
-                text: c.value().to_owned(),
-                changed: c.tag() != ChangeTag::Equal,
-                syntax: String::new(),
-            });
+    use unicode_segmentation::UnicodeSegmentation;
+    let a: Vec<_> = old.graphemes(true).collect();
+    let b: Vec<_> = new.graphemes(true).collect();
+    let mut left = vec![];
+    let mut right = vec![];
+    for op in similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &a,
+        &b,
+        Some(Instant::now() + std::time::Duration::from_millis(100)),
+    ) {
+        let (tag, x, y) = op.as_tag_tuple();
+        if !x.is_empty() {
+            left.extend(span(&a[x].concat(), tag != similar::DiffTag::Equal));
         }
-        if c.tag() != ChangeTag::Delete {
-            right.push(Span {
-                text: c.value().to_owned(),
-                changed: c.tag() != ChangeTag::Equal,
-                syntax: String::new(),
-            });
+        if !y.is_empty() {
+            right.extend(span(&b[y].concat(), tag != similar::DiffTag::Equal));
         }
     }
     (left, right)
+}
+
+fn pairing(left: &[Row], right: &[Row], limit: usize) -> Vec<(Option<usize>, Option<usize>)> {
+    let n = left.len();
+    let m = right.len();
+    if n.saturating_mul(m) > limit {
+        return (0..n)
+            .map(|i| (Some(i), None))
+            .chain((0..m).map(|i| (None, Some(i))))
+            .collect();
+    }
+    let tokens = |r: &Row, old: bool| {
+        let text: String = (if old { &r.left } else { &r.right })
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect::<BTreeSet<_>>()
+    };
+    let a: Vec<_> = left.iter().map(|r| tokens(r, true)).collect();
+    let b: Vec<_> = right.iter().map(|r| tokens(r, false)).collect();
+    let score = |i: usize, j: usize| {
+        let total = a[i].len() + b[j].len();
+        if total == 0 {
+            1.0
+        } else {
+            2.0 * a[i].intersection(&b[j]).count() as f32 / total as f32
+        }
+    };
+    let mut dp = vec![0f32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let matched = score(i, j) - 0.3;
+            dp[i * (m + 1) + j] =
+                dp[(i + 1) * (m + 1) + j]
+                    .max(dp[i * (m + 1) + j + 1])
+                    .max(if matched > 0.0 {
+                        dp[(i + 1) * (m + 1) + j + 1] + matched
+                    } else {
+                        0.0
+                    });
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut result = vec![];
+    while i < n || j < m {
+        if i < n
+            && j < m
+            && score(i, j) > 0.3
+            && dp[i * (m + 1) + j] <= dp[(i + 1) * (m + 1) + j + 1] + score(i, j) - 0.3 + 0.00001
+        {
+            result.push((Some(i), Some(j)));
+            i += 1;
+            j += 1;
+        } else if i < n && (j == m || dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) {
+            result.push((Some(i), None));
+            i += 1;
+        } else {
+            result.push((None, Some(j)));
+            j += 1;
+        }
+    }
+    result
 }
 
 pub fn text_rows(
@@ -99,7 +163,8 @@ pub fn patch_rows(patch: &[u8], config: &DiffConfig, limits: &Limits) -> Vec<Row
         if line.starts_with("@@ ") {
             let fields: Vec<_> = line.split_whitespace().collect();
             let number = |s: &str| {
-                s[1..]
+                s.get(1..)
+                    .unwrap_or("")
                     .split(',')
                     .next()
                     .and_then(|n| n.parse::<usize>().ok())
@@ -165,56 +230,103 @@ fn align(rows: Vec<Row>, config: &DiffConfig, limits: &Limits) -> Vec<Row> {
         while i < rows.len() && rows[i].kind == "insert" {
             i += 1;
         }
-        let count = (split - begin).min(i - split);
         let bounded = (split - begin).saturating_mul(i - split) <= limits.max_alignment_cells;
-        for n in 0..(split - begin).max(i - split) {
-            if n < count && bounded {
-                let a = &rows[begin + n];
-                let b = &rows[split + n];
-                let old: String = a.left.iter().map(|s| s.text.as_str()).collect();
-                let new: String = b.right.iter().map(|s| s.text.as_str()).collect();
-                let (left, right) =
-                    if old.len().saturating_mul(new.len()) <= limits.max_alignment_cells {
-                        inline(&old, &new)
-                    } else {
-                        (span(&old, true), span(&new, true))
-                    };
-                out.push(Row {
-                    kind: "replace".into(),
-                    old: a.old,
-                    new: b.new,
-                    left,
-                    right,
-                    moved: None,
-                });
-            } else {
-                if n < split - begin {
-                    out.push(rows[begin + n].clone());
+        if !bounded {
+            out.push(Row {
+                kind: "hunk".into(),
+                old: None,
+                new: None,
+                left: span("alignment_budget_exceeded: original edits retained", false),
+                right: vec![],
+                moved: None,
+            });
+        }
+        for (a, b) in pairing(
+            &rows[begin..split],
+            &rows[split..i],
+            limits.max_alignment_cells,
+        ) {
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let a = &rows[begin + a];
+                    let b = &rows[split + b];
+                    let old: String = a.left.iter().map(|s| s.text.as_str()).collect();
+                    let new: String = b.right.iter().map(|s| s.text.as_str()).collect();
+                    let (left, right) =
+                        if old.len().saturating_mul(new.len()) <= limits.max_alignment_cells {
+                            inline(&old, &new)
+                        } else {
+                            (span(&old, true), span(&new, true))
+                        };
+                    out.push(Row {
+                        kind: "replace".into(),
+                        old: a.old,
+                        new: b.new,
+                        left,
+                        right,
+                        moved: None,
+                    });
                 }
-                if n < i - split {
-                    out.push(rows[split + n].clone());
-                }
+                (Some(a), None) => out.push(rows[begin + a].clone()),
+                (None, Some(b)) => out.push(rows[split + b].clone()),
+                _ => unreachable!(),
             }
         }
     }
     if config.moved_lines {
-        let mut deleted: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, r) in out.iter().enumerate() {
-            if r.kind == "delete" {
-                let s: String = r.left.iter().map(|s| s.text.as_str()).collect();
-                if s.trim().len() > 3 {
-                    deleted.entry(s).or_default().push(i);
-                }
+        let mut blocks: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
+        let mut cursor = 0;
+        while cursor < out.len() {
+            if out[cursor].kind != "delete" {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < out.len() && out[cursor].kind == "delete" {
+                cursor += 1;
+            }
+            let indices: Vec<_> = (start..cursor).collect();
+            let text = indices
+                .iter()
+                .map(|&i| {
+                    out[i]
+                        .left
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().len() > 3 {
+                blocks.entry(text).or_default().push(indices);
             }
         }
         let mut id = 0;
-        for i in 0..out.len() {
-            if out[i].kind == "insert" {
-                let s: String = out[i].right.iter().map(|s| s.text.as_str()).collect();
-                if let Some(indices) = deleted.get_mut(&s) {
-                    if let Some(j) = indices.pop() {
-                        id += 1;
-                        out[j].moved = Some(id);
+        cursor = 0;
+        while cursor < out.len() {
+            if out[cursor].kind != "insert" {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < out.len() && out[cursor].kind == "insert" {
+                cursor += 1;
+            }
+            let text = (start..cursor)
+                .map(|i| {
+                    out[i]
+                        .right
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(candidates) = blocks.get_mut(&text) {
+                if !candidates.is_empty() {
+                    let indices = candidates.remove(0);
+                    id += 1;
+                    for i in indices.into_iter().chain(start..cursor) {
                         out[i].moved = Some(id);
                     }
                 }
@@ -364,6 +476,40 @@ pub fn build(
         Some(p) => patch_rows(p, config, limits),
         None => text_rows(&a, &b, old_start, new_start, config, limits),
     };
+    if patch.is_some() && (old_start != 1 || new_start != 1) {
+        for row in &mut rows {
+            row.old = row.old.map(|n| n + old_start - 1);
+            row.new = row.new.map(|n| n + new_start - 1);
+            if row.kind == "hunk" {
+                for span in &mut row.left {
+                    let fields: Vec<_> = span.text.split_whitespace().collect();
+                    if fields.len() >= 3 {
+                        let coord = |token: &str, offset: usize| {
+                            let mut parts = token[1..].split(',');
+                            let n = parts.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+                            format!(
+                                "{}{},{}",
+                                &token[..1],
+                                if n == 0 { 0 } else { n + offset },
+                                parts.next().unwrap_or("1")
+                            )
+                        };
+                        span.text = format!(
+                            "@@ {} {} @@ scoped function",
+                            coord(fields[1], old_start - 1),
+                            coord(fields[2], new_start - 1)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if !old.is_empty() && !old.ends_with(b"\n") {
+        note.push_str(" · old source has no final newline");
+    }
+    if !new.is_empty() && !new.ends_with(b"\n") {
+        note.push_str(" · new source has no final newline");
+    }
     apply_highlights(path, old, new, old_start, new_start, &mut rows, limits);
     FileDiff {
         path: path.into(),
@@ -385,6 +531,15 @@ pub fn build(
         language,
         syntax: summary,
         continuation: None,
+        document: Some(crate::document::DiffDocument::build(
+            path,
+            old,
+            new,
+            old_start,
+            new_start,
+            limits.max_alignment_cells,
+        )),
+        canonical_patch: patch.map(|p| STANDARD.encode(p)),
     }
 }
 

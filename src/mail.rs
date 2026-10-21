@@ -97,6 +97,9 @@ pub fn revision(c: &Config, id: &str, mail: &MailConfig) -> String {
             &c.diff,
             c.defaults.max_message_bytes,
             c.limits.max_part_count,
+            c.limits.max_render_output_bytes,
+            &c.limits.render_timeout,
+            c.limits.max_worker_address_space_bytes,
         ))
         .expect("mail revision"),
     )

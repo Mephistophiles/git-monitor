@@ -47,6 +47,10 @@ pub struct FileDiff {
     pub syntax: Option<SyntaxSummary>,
     #[serde(default)]
     pub continuation: Option<Continuation>,
+    #[serde(default)]
+    pub document: Option<crate::document::DiffDocument>,
+    #[serde(default)]
+    pub canonical_patch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +104,22 @@ impl FileDiff {
             language: String::new(),
             syntax: None,
             continuation: None,
+            document: None,
+            canonical_patch: None,
         }
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        anyhow::ensure!(
+            self.document.is_some() || self.engine == "metadata" || self.continuation.is_some(),
+            "publishable text diff is missing its document"
+        );
+        if let Some(doc) = &self.document {
+            doc.reconstruct(
+                &STANDARD.decode(&self.old_bytes)?,
+                &STANDARD.decode(&self.new_bytes)?,
+            )?;
+        }
+        Ok(())
     }
 }

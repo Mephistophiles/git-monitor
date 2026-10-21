@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import sys
 
 
 def main():
@@ -43,8 +44,15 @@ def main():
     command = ["cargo", "test", "--tests", "--locked"]
     if args.offline:
         command.append("--offline")
-    build = subprocess.check_output(command + ["--no-run", "--message-format=json"],
-                                    cwd=root, env=env, text=True)
+    built = subprocess.run(command + ["--no-run", "--message-format=json"],
+                           cwd=root, env=env, text=True, stdout=subprocess.PIPE)
+    build = built.stdout
+    if built.returncode:
+        for line in build.splitlines():
+            message=json.loads(line)
+            if message.get("reason")=="compiler-message":
+                print(message["message"].get("rendered",message["message"]["message"]),file=sys.stderr)
+        built.check_returncode()
     objects = set()
     for line in build.splitlines():
         artifact = json.loads(line)

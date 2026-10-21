@@ -92,6 +92,14 @@ fn file(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
             c.part,c.total,c.old_range.0,c.old_range.1,c.new_range.0,c.new_range.1,c.old_sha256,c.new_sha256));
         out.push_str(&format!("<button data-export=\"{}\" data-export-name=\"old-part-{}\">Download old range</button><button data-export=\"{}\" data-export-name=\"new-part-{}\">Download new range</button>",f.old_bytes,c.part,f.new_bytes,c.part));
     }
+    if f.document.is_some() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let json = STANDARD.encode(serde_json::to_vec(f).expect("diff export"));
+        out.push_str(&format!("<button data-export=\"{json}\" data-export-name=\"scoped-diff.json\">Download diff model</button>"));
+    }
+    if let Some(patch) = &f.canonical_patch {
+        out.push_str(&format!("<button data-export=\"{patch}\" data-export-name=\"change.patch\">Download patch</button>"));
+    }
     if !f.note.is_empty() {
         out.push_str(&format!("<div class=\"note\">{}</div>", escape(&f.note)));
     }

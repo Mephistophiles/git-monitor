@@ -27,8 +27,10 @@ pub struct Changed {
 }
 #[derive(Debug)]
 pub struct Selection {
+    pub oid: String,
     pub bytes: Vec<u8>,
     pub start: usize,
+    pub offset: usize,
 }
 
 impl Git {
@@ -501,6 +503,37 @@ impl Git {
             path,
         ])
     }
+    pub fn snippet_patch(&self, old: &[u8], new: &[u8], context: usize) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let mut a = tempfile::NamedTempFile::new()?;
+        let mut b = tempfile::NamedTempFile::new()?;
+        a.write_all(old)?;
+        b.write_all(new)?;
+        let output = process::run(
+            self.command()
+                .args([
+                    "diff",
+                    "--no-index",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--diff-algorithm=histogram",
+                    &format!("--unified={context}"),
+                ])
+                .arg(a.path())
+                .arg(b.path()),
+            duration(&self.execution.git_timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        ensure!(
+            output.code == 0 || output.code == 1,
+            "cannot generate scoped histogram diff"
+        );
+        Ok(output.stdout)
+    }
     pub fn blob(&self, oid: Option<&str>) -> Result<Vec<u8>> {
         let Some(oid) = oid else {
             return Ok(vec![]);
@@ -616,8 +649,10 @@ impl Git {
         let begin = lines[start - 1].0;
         let end = lines[start - 1 + count - 1].1;
         Ok(Some(Selection {
+            oid,
             bytes: bytes[begin..end].to_vec(),
             start,
+            offset: begin,
         }))
     }
 }

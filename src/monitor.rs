@@ -155,22 +155,41 @@ fn selected(
             ));
         }
         if a.as_ref().map(|s| &s.bytes) != b.as_ref().map(|s| &s.bytes) {
+            let patch = git.snippet_patch(
+                a.as_ref().map_or(&[], |s| s.bytes.as_slice()),
+                b.as_ref().map_or(&[], |s| s.bytes.as_slice()),
+                task.diff.context_lines,
+            )?;
             let mut fd = diff::build(
                 &f.path,
                 a.as_ref().map_or(&[], |s| s.bytes.as_slice()),
                 b.as_ref().map_or(&[], |s| s.bytes.as_slice()),
                 a.as_ref().map_or(1, |s| s.start),
                 b.as_ref().map_or(1, |s| s.start),
-                None,
+                Some(&patch),
                 &task.diff,
                 &task.limits,
             );
+            fd.canonical_patch = None;
             fd.kind = match (a.is_some(), b.is_some()) {
                 (false, true) => "function_appeared",
                 (true, false) => "function_disappeared",
                 _ => "function_modified",
             }
             .into();
+            if let Some(document) = &mut fd.document {
+                document.old.blob = a.as_ref().map(|s| s.oid.clone());
+                document.new.blob = b.as_ref().map(|s| s.oid.clone());
+                let old_offset = a.as_ref().map_or(0, |s| s.offset);
+                let new_offset = b.as_ref().map_or(0, |s| s.offset);
+                document.old.original_range.start += old_offset;
+                document.old.original_range.end += old_offset;
+                document.new.original_range.start += new_offset;
+                document.new.original_range.end += new_offset;
+                document
+                    .quality
+                    .push("scoped_function_diff_not_a_whole_file_patch".into());
+            }
             fd.note = format!(
                 "{} · scoped function diff · selector {}",
                 fd.note, f.expression
@@ -239,6 +258,12 @@ fn selected(
                 if a == b {
                     f.kind = "mode_changed".into();
                     f.note = format!("File mode {} → {}", change.old_mode, change.new_mode);
+                }
+                if let Some(document) = &mut f.document {
+                    document.old.blob = change.old_blob.clone();
+                    document.new.blob = change.new_blob.clone();
+                    document.old.mode = change.old_mode.clone();
+                    document.new.mode = change.new_mode.clone();
                 }
                 Ok(f)
             };
