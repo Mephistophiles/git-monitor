@@ -1,0 +1,48 @@
+version = 1
+
+[storage]
+repositories_dir = "../var/repos"
+state_dir = "../var/state"
+
+[execution]
+git_timeout = "3m"
+bootstrap_timeout = "30m"
+shutdown_grace = "60s"
+
+[defaults]
+poll_every = "5m"
+digest_every = "1h"
+new_branch_mode = "summary"
+max_message_bytes = 15000000
+
+[diff]
+mode = "auto"
+layouts = ["unified", "side-by-side"]
+theme = "light"
+line_numbers = true
+moved_lines = true
+context_lines = 3
+
+[recipients.developer]
+to = ["you@example.org"]
+
+[repositories.llvm.remotes.upstream]
+url = "https://github.com/llvm/llvm-project.git"
+
+[[watches]]
+id = "asan-runtime"
+repository = "llvm"
+remotes = ["upstream"]
+recipients = ["developer"]
+branches = { include = ["main", "release/**"] }
+paths = ["compiler-rt/lib/asan/**"]
+exclude_paths = ["**/test/**"]
+
+# Use a separate watch for a function. The expression is interpreted by Git -L.
+# [[watches]]
+# id = "thread-start"
+# repository = "llvm"
+# remotes = ["upstream"]
+# recipients = ["developer"]
+# branches = { include = ["main"] }
+# function = { path = "compiler-rt/lib/asan/asan_thread.cpp", match = "ThreadStart" }

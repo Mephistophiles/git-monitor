@@ -1,0 +1,50 @@
+name: Architecture isolation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  architecture-isolation:
+    name: Architecture changes must be separate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject mixed architecture and implementation changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          # Compare the complete PR, including all its commits. Disabling rename
+          # detection preserves both paths when ARCHITECTURE.md is moved.
+          paths = subprocess.check_output([
+              "git", "diff", "--name-only", "--no-renames", "-z",
+              f"{os.environ['BASE_SHA']}...{os.environ['HEAD_SHA']}", "--",
+          ]).split(b"\0")
+          paths = [path for path in paths if path]
+          architecture = b"ARCHITECTURE.md"
+          other_paths = [path for path in paths if path != architecture]
+
+          if architecture in paths and other_paths:
+              print(
+                  "::error::ARCHITECTURE.md must be changed in a separate PR. "
+                  "Do not mix architecture changes with any other files."
+              )
+              print("Other changed files (escaped):")
+              for path in other_paths:
+                  print(f"  {path!r}")
+              sys.exit(1)
+
+          print("Architecture isolation check passed.")
+          PY
