@@ -384,6 +384,7 @@ pub fn build(
         new_start,
         language,
         syntax: summary,
+        continuation: None,
     }
 }
 

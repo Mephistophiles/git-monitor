@@ -23,6 +23,27 @@ pub struct Config {
     pub repositories: BTreeMap<String, Repository>,
     #[serde(default)]
     pub watches: Vec<Watch>,
+    #[serde(default)]
+    pub maintenance: Maintenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Maintenance {
+    pub cache_items: usize,
+    pub history_days: u64,
+    pub artifact_days: u64,
+    pub temporary_hours: u64,
+}
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            cache_items: 10000,
+            history_days: 90,
+            artifact_days: 30,
+            temporary_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +129,8 @@ impl Default for DiffConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
+    pub render_timeout: String,
+    pub max_render_output_bytes: usize,
     pub max_blob_bytes: usize,
     pub max_patch_bytes: usize,
     pub max_job_output_bytes: usize,
@@ -122,6 +145,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            render_timeout: "30s".into(),
+            max_render_output_bytes: 256_000_000,
             max_blob_bytes: 32_000_000,
             max_patch_bytes: 64_000_000,
             max_job_output_bytes: 128_000_000,
@@ -319,6 +344,7 @@ impl Config {
             &self.defaults.digest_every,
             &self.limits.analysis_timeout,
             &self.limits.syntax_timeout,
+            &self.limits.render_timeout,
         ] {
             duration(s)?;
         }
@@ -328,6 +354,7 @@ impl Config {
         );
         ensure!(
             self.limits.max_blob_bytes > 0
+                && self.limits.max_render_output_bytes > 0
                 && self.limits.max_patch_bytes > 0
                 && self.limits.max_job_output_bytes > 0
                 && self.limits.max_part_count > 0,

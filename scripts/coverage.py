@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 
 def main():
@@ -22,10 +23,10 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     target = root / "target" / "coverage"
-    profiles = target / "profiles"
-    if profiles.exists():
-        shutil.rmtree(profiles)
-    profiles.mkdir(parents=True)
+    target.mkdir(parents=True,exist_ok=True)
+    # A unique run directory also isolates late profile flushes from an older
+    # interrupted run. Never delete a directory another process may be writing.
+    profiles = Path(tempfile.mkdtemp(prefix="profiles-",dir=target))
     sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
     host = next(line.split(": ", 1)[1] for line in subprocess.check_output(
         ["rustc", "-vV"], text=True).splitlines() if line.startswith("host: "))

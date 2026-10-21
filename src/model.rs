@@ -45,6 +45,18 @@ pub struct FileDiff {
     pub new_start: usize,
     pub language: String,
     pub syntax: Option<SyntaxSummary>,
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Continuation {
+    pub part: usize,
+    pub total: usize,
+    pub old_range: (usize, usize),
+    pub new_range: (usize, usize),
+    pub old_sha256: String,
+    pub new_sha256: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,6 +99,7 @@ impl FileDiff {
             new_start: 1,
             language: String::new(),
             syntax: None,
+            continuation: None,
         }
     }
 }

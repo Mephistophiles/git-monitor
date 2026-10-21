@@ -3,11 +3,14 @@ pub mod diff;
 pub mod doctor;
 pub mod git;
 pub mod mail;
+pub mod maintenance;
 pub mod model;
 pub mod monitor;
+pub mod prepare;
 pub mod process;
 pub mod profile;
 pub mod render;
+pub mod split;
 pub mod store;
 
 use sha2::{Digest, Sha256};

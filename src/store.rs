@@ -143,7 +143,13 @@ impl Store {
           CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, revision TEXT NOT NULL, digest TEXT NOT NULL, mime BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
           CREATE TABLE IF NOT EXISTS clocks(recipient TEXT PRIMARY KEY, last_digest INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS active_sources(repository TEXT NOT NULL, remote TEXT NOT NULL, identity TEXT NOT NULL, key TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(repository,remote));
+          CREATE TABLE IF NOT EXISTS maintenance_log(id INTEGER PRIMARY KEY,body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS delivery_times(digest TEXT PRIMARY KEY,created INTEGER NOT NULL);
           PRAGMA user_version=3; COMMIT;")?;
+        db.execute(
+            "INSERT OR IGNORE INTO delivery_times SELECT DISTINCT digest,? FROM deliveries",
+            [crate::now()],
+        )?;
         // A single instance owns the DB; any running jobs were interrupted.
         db.execute("UPDATE jobs SET state='pending' WHERE state='running'", [])?;
         db.execute(
@@ -192,6 +198,29 @@ impl Store {
         self.db.execute("INSERT INTO active_sources VALUES(?,?,?,?,?) ON CONFLICT(repository,remote) DO UPDATE SET identity=excluded.identity,key=excluded.key,epoch=excluded.epoch",
             params![repository,remote,identity,key,epoch])?;
         Ok(key)
+    }
+    pub fn retire_disabled_sources(&self, cfg: &Config) -> Result<()> {
+        let rows: Vec<(String, String)> = self
+            .db
+            .prepare(
+                "SELECT repository,remote FROM active_sources WHERE identity NOT LIKE 'inactive:%'",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for (repository, remote) in rows {
+            if !cfg
+                .repositories
+                .get(&repository)
+                .is_some_and(|r| r.remotes.contains_key(&remote))
+                || !cfg
+                    .watches
+                    .iter()
+                    .any(|w| w.repository == repository && w.remotes.contains(&remote))
+            {
+                self.db.execute("UPDATE active_sources SET identity='inactive:' || identity WHERE repository=? AND remote=?",params![repository,remote])?;
+            }
+        }
+        Ok(())
     }
     pub fn active_source(&self, repository: &str, remote: &str, identity: &str) -> Result<String> {
         Ok(self

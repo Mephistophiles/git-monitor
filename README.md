@@ -116,16 +116,18 @@ MIME bytes and Message-ID are persisted before SMTP. Ambiguous attempts retain t
 - Identical selected old/new analyses are cached independently of watch names and recipient addresses. Event bindings remain separate.
 - Configuration is read once per process. Apply edits by stopping and restarting. SIGTERM/SIGINT stops new work, drains active work within `shutdown_grace`, and leaves unfinished jobs recoverable. SIGHUP is ignored.
 - Worker processes have address-space, execution-time, and output budgets. Oversized objects get explicit diagnostics; they do not become empty successful matches.
-- MIME parts are packed by file. A single item that cannot fit is replaced with an explicit `oversized_item` card; its full scoped report remains local. Other changes can still be delivered. Increase limits and use `retry-analysis --job ID` for completed or failed analysis jobs.
+- HTML/MIME generation runs in an isolated worker with `render_timeout`, `max_worker_address_space_bytes`, and `max_render_output_bytes` budgets. Files, hunks and long lines can continue across MIME parts; continuations record selected-source byte ranges, order and full-content SHA-256 hashes. Valid UTF-8 is split at character boundaries. If the part count cannot hold the result, an explicit `oversized_item` card is sent; full analysis remains in SQLite for retry.
 
 ```sh
 git-monitor --config examples/monitor.toml retry-analysis --job 42
 git-monitor --config examples/monitor.toml run --once --force
 ```
 
-Do not share a managed repository directory between unrelated state directories. Repository locks guard active caches. Object pins are intentionally retained in v0.1; automatic pin/cache retention and maintenance are not implemented yet.
+Do not share a managed repository directory between unrelated state directories. Repository locks guard active caches. Run `git-monitor --config monitor.toml maintain` between passes, or schedule it separately. It recovers fetch attempts first, expires completed/delivered history, bounds disposable cache entries, removes unbound old artifacts and temporary files, and releases unnecessary pins. Pending jobs, failed analysis and unsent/uncertain deliveries do not expire by age. `maintain --gc` also writes commit graphs, repacks and prunes managed Git caches under the repository locks.
 
-State databases upgrade automatically from schema 1 to 2 when opened by this version. Older binaries reject schema 2, preventing them from misinterpreting unfinished selected-branch attempts.
+Retention settings are `maintenance.history_days = 90`, `artifact_days = 30`, `temporary_hours = 24`, and `cache_items = 10000`. Retained jobs keep their input OIDs and remain retryable after GC. Jobs in expired completed history are no longer available to retry.
+
+State databases upgrade automatically to schema 3, including durable source epochs.
 
 ## Diff engine
 
@@ -183,6 +185,6 @@ an earlier context, establish a fresh epoch and baseline. `doctor` performs
 offline capability probes, storage write checks, worker-limit and queue-integrity
 checks without contacting configured remotes or SMTP.
 
-This is the first executable implementation of [ARCHITECTURE.md](ARCHITECTURE.md), not every planned optimization. Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Oversized single-line byte-chunk delivery and automatic retention are deferred.
+This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
 
 Licensed under [MIT](LICENSE).

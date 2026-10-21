@@ -1,4 +1,14 @@
 use anyhow::{bail, Context, Result};
+static WORKER_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+pub fn set_worker_executable(path: std::path::PathBuf) {
+    let _ = WORKER_EXE.set(path);
+}
+pub fn worker_executable() -> Result<std::path::PathBuf> {
+    Ok(WORKER_EXE
+        .get()
+        .cloned()
+        .unwrap_or(std::env::current_exe()?))
+}
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},

@@ -35,6 +35,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 impl Fixture {
     fn new(function: bool) -> Self {
+        git_monitor::process::set_worker_executable(PathBuf::from(BIN));
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let work = root.join("work");
@@ -1593,6 +1594,122 @@ fn configured_file_context_is_respected() {
 }
 
 #[test]
+fn maintenance_keeps_pending_results_and_gc_preserves_queued_objects() {
+    let f = Fixture::new(false);
+    f.ok();
+    let base = git(&f.work, &["rev-parse", "HEAD"]);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1"),
+        "Queued before rollback",
+    );
+    let cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    git(&f.work, &["reset", "--hard", &base]);
+    std::fs::write(
+        f.work.join("test.c"),
+        BEFORE.replace("value > 0", "value > 2"),
+    )
+    .unwrap();
+    git(&f.work, &["commit", "-qam", "Replacement"]);
+    git(&f.work, &["push", "--force", "-q", "origin", "main"]);
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    let summary =
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    assert_eq!(summary.events, 0);
+    assert_eq!(store.jobs().unwrap().len(), 2);
+    drop(store);
+    f.ok();
+    assert!(f.report().contains("Queued before rollback"));
+    assert!(!f.report().contains("analysis_failed"));
+}
+
+#[test]
+fn maintenance_expires_completed_history_and_cleans_only_unbound_artifacts() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1"),
+        "Retained pending result",
+    );
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    cfg.maintenance.history_days = 0;
+    cfg.maintenance.artifact_days = 0;
+    cfg.maintenance.temporary_hours = 0;
+    cfg.maintenance.cache_items = 0;
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE events SET body=json_set(body,'$.observed_at',0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), false)
+            .unwrap()
+            .events,
+        0
+    );
+    store
+        .db
+        .execute("UPDATE matches SET digest='delivered-test'", [])
+        .unwrap();
+    store.db.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime,state) VALUES('pending-test','alice','test','protected','mime','uncertain')",[]).unwrap();
+    store.db.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime,state) VALUES('sent-test','alice','test','expired','mime','sent')",[]).unwrap();
+    store
+        .db
+        .execute("INSERT INTO delivery_times VALUES('expired',0)", [])
+        .unwrap();
+    let artifacts = cfg.storage.state_dir.join("artifacts");
+    std::fs::write(artifacts.join("orphan.html"), "orphan").unwrap();
+    std::fs::write(artifacts.join("protected-1.html"), "pending attachment").unwrap();
+    std::fs::write(cfg.storage.state_dir.join("tmp/orphan.tmp"), "orphan").unwrap();
+    let result =
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    assert_eq!(result.events, 1);
+    assert!(result.files >= 2);
+    assert!(result.pins > 0);
+    assert!(artifacts.join("alice-latest.html").exists());
+    assert!(artifacts.join("protected-1.html").exists());
+    assert!(!artifacts.join("orphan.html").exists());
+    assert_eq!(f.count("cache"), 0);
+    assert_eq!(f.count("jobs"), 0);
+    assert_eq!(f.count("deliveries"), 1);
+}
+
+#[test]
+fn report_worker_budget_creates_a_diagnostic_without_blocking_the_run() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Saved scoped analysis",
+    );
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        format!("{text}\n[limits]\nmax_render_output_bytes=1\n"),
+    )
+    .unwrap();
+    f.ok();
+    assert!(f.report().contains("rendering/packaging exceeded"));
+    let count: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM matches WHERE body LIKE '%Saved scoped analysis%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "render failure cannot discard full analysis");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    assert!(f.report().contains("Saved scoped analysis"));
+}
+
+#[test]
 fn source_context_rotation_and_return_create_fresh_epochs() {
     let f = Fixture::new(false);
     f.ok();
@@ -1711,6 +1828,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
     let f = Fixture::new(false);
     let mut cfg = Config::load(&f.config).unwrap();
     cfg.defaults.max_message_bytes = 40000;
+    cfg.limits.max_part_count = 2;
     let mail = git_monitor::mail::MailConfig {
         version: 1,
         smtp: git_monitor::mail::Smtp {
@@ -1756,7 +1874,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
     };
     let parts = git_monitor::mail::package(&report, &cfg.recipients["alice"], &mail, &cfg).unwrap();
     assert!(parts.iter().all(|p| p.1.len() <= 40000));
-    assert!(parts[0].2.contains("MIME item exceeds"));
+    assert!(parts[0].2.contains("oversized_item"));
 }
 
 #[test]

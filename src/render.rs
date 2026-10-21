@@ -87,6 +87,11 @@ fn file(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
     if let Some(s) = &f.syntax {
         out.push_str(&format!("<div class=\"syntax-meta\"><span class=\"dot\"></span> Syntax-aware <span>· {} unchanged subtrees</span><span>· {} tokens removed / {} added</span>{}</div>",s.unchanged_subtrees,s.deleted_tokens,s.inserted_tokens,if s.text_only_change{"<span class=\"badge\">Formatting / comment change</span>"}else{""}));
     }
+    if let Some(c) = &f.continuation {
+        out.push_str(&format!("<div class=\"note\">Continuation {}/{} · old bytes {}..{} · new bytes {}..{} · source ranges are relative to this watch's selected content. Concatenate exports in part order; old SHA-256 {}; new SHA-256 {}.</div>",
+            c.part,c.total,c.old_range.0,c.old_range.1,c.new_range.0,c.new_range.1,c.old_sha256,c.new_sha256));
+        out.push_str(&format!("<button data-export=\"{}\" data-export-name=\"old-part-{}\">Download old range</button><button data-export=\"{}\" data-export-name=\"new-part-{}\">Download new range</button>",f.old_bytes,c.part,f.new_bytes,c.part));
+    }
     if !f.note.is_empty() {
         out.push_str(&format!("<div class=\"note\">{}</div>", escape(&f.note)));
     }

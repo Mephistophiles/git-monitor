@@ -5,7 +5,6 @@ use crate::{
     mail::{self, MailConfig},
     model::{CommitView, EventView, FileDiff, Report},
     process::{self, Shutdown},
-    render,
     store::{Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
 };
 use anyhow::{ensure, Context, Result};
@@ -391,6 +390,7 @@ pub fn collect(
     force: bool,
 ) -> Result<(usize, usize)> {
     let mut events = recover(store, shutdown)?;
+    store.retire_disabled_sources(cfg)?;
     let mut failures = 0;
     for (repository, r) in &cfg.repositories {
         if shutdown.requested() {
@@ -523,7 +523,7 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
         let input = tmp.join(format!("job-{id}.json"));
         let output = tmp.join(format!("result-{id}.json"));
         crate::atomic_write(&input, &serde_json::to_vec(&task)?)?;
-        let mut cmd = Command::new(std::env::current_exe()?);
+        let mut cmd = Command::new(process::worker_executable()?);
         cmd.arg("worker")
             .arg("--input")
             .arg(&input)
@@ -717,6 +717,9 @@ pub fn outputs(
     std::fs::create_dir_all(&artifacts)?;
     let mut queued = 0;
     for (recipient, r) in &cfg.recipients {
+        if shutdown.requested() {
+            break;
+        }
         if let Some(mail) = mail_config {
             let revision = mail::revision(cfg, recipient, mail);
             let stale: Vec<String> = store.db.prepare("SELECT DISTINCT digest FROM deliveries WHERE recipient=? AND revision<>? AND state NOT IN ('sent','revoked')")?.query_map(params![recipient, revision], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
@@ -735,42 +738,57 @@ pub fn outputs(
             }
         }
         let (pending, ids) = report(cfg, store, recipient, mail_config.is_some())?;
-        let html = if pending.events.is_empty() && mail_config.is_some() {
-            render::html(&report(cfg, store, recipient, false)?.0, &cfg.diff)
-        } else {
-            render::html(&pending, &cfg.diff)
-        };
-        crate::atomic_write(
-            &artifacts.join(format!("{recipient}-latest.html")),
-            html.as_bytes(),
-        )?;
-        if let Some(dir) = output {
-            crate::atomic_write(&dir.join(format!("{recipient}.html")), html.as_bytes())?;
-        }
-        let Some(mail) = mail_config else {
-            continue;
-        };
-        let revision = mail::revision(cfg, recipient, mail);
         let interval = duration(
             r.digest_every
                 .as_deref()
                 .unwrap_or(&cfg.defaults.digest_every),
         )?
         .as_secs();
-        let last = store.clock(recipient)?;
-        if pending.events.is_empty()
-            || crate::now().saturating_sub(last) < interval
-            || shutdown.requested()
-        {
+        let ready = mail_config.is_some()
+            && !pending.events.is_empty()
+            && crate::now().saturating_sub(store.clock(recipient)?) >= interval
+            && !shutdown.requested();
+        let preview = if pending.events.is_empty() && mail_config.is_some() {
+            report(cfg, store, recipient, false)?.0
+        } else {
+            pending.clone()
+        };
+        let prepared = match crate::prepare::bounded(
+            cfg,
+            &preview,
+            if ready { Some(r) } else { None },
+            mail_config.map(|m| m.smtp.from.as_str()),
+            shutdown,
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) if shutdown.requested() => break,
+            Err(error) => return Err(error),
+        };
+        crate::atomic_write(
+            &artifacts.join(format!("{recipient}-latest.html")),
+            prepared.html.as_bytes(),
+        )?;
+        if let Some(dir) = output {
+            crate::atomic_write(
+                &dir.join(format!("{recipient}.html")),
+                prepared.html.as_bytes(),
+            )?;
+        }
+        if !ready {
             continue;
         }
-        let parts = mail::package(&pending, r, mail, cfg)?;
+        let revision = mail::revision(cfg, recipient, mail_config.unwrap());
+        let parts = prepared.parts;
         let tx = store.db.transaction()?;
         let digest = crate::hash(serde_json::to_vec(&(
             &revision,
             &ids,
             pending.generated_at,
         ))?);
+        tx.execute(
+            "INSERT OR IGNORE INTO delivery_times VALUES(?,?)",
+            params![digest, crate::now()],
+        )?;
         for (index, (id, mime, html)) in parts.into_iter().enumerate() {
             let artifact = artifacts.join(format!("{digest}-{}.html", index + 1));
             crate::atomic_write(&artifact, html.as_bytes())?;
