@@ -3,7 +3,7 @@ use git_monitor::{
     git::{repository_path, Git},
     model::Report,
     process::Shutdown,
-    store::{source_key, Attempt, Store},
+    store::{source_key, Attempt, FetchPlan, Store},
 };
 use std::{
     path::{Path, PathBuf},
@@ -106,6 +106,511 @@ impl Fixture {
     fn report(&self) -> String {
         std::fs::read_to_string(self.root.join("state/artifacts/alice-latest.html")).unwrap()
     }
+    fn branches(&self, branches: &str) {
+        let text = std::fs::read_to_string(&self.config).unwrap();
+        std::fs::write(&self.config, text.replace("branches={all=true}", branches)).unwrap();
+    }
+    fn begin_attempt(&self) -> (Store, i64, Attempt, Git) {
+        let cfg = Config::load(&self.config).unwrap();
+        let store = Store::open(&cfg.storage.state_dir).unwrap();
+        let key = source_key("project", "origin", self.remote.to_str().unwrap());
+        let (old, previous, _) = store.snapshot(&key).unwrap().unwrap();
+        let git = Git {
+            path: repository_path(&cfg.storage.repositories_dir, "project"),
+            execution: cfg.execution.clone(),
+            limits: cfg.limits.clone(),
+            shutdown: Shutdown::default(),
+        };
+        let attempt = Attempt {
+            key,
+            repository: "project".into(),
+            remote: "origin".into(),
+            path: git.path.clone(),
+            old,
+            published: git.refs("origin").unwrap(),
+            initialized: true,
+            plan: FetchPlan::for_watches(&cfg.watches),
+            watches: cfg.watches,
+            previous,
+            execution: cfg.execution,
+            limits: cfg.limits,
+            diff: cfg.diff,
+        };
+        for oid in attempt.old.values() {
+            git.pin(oid).unwrap();
+        }
+        let id = store.begin(&attempt).unwrap();
+        (store, id, attempt, git)
+    }
+    #[cfg(unix)]
+    fn wrapped_run(&self, script: &str) -> Output {
+        use std::os::unix::fs::PermissionsExt;
+        let actual = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let bin = self.root.join("wrapper-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n{}\nexec '{}' \"$@\"\n",
+                script.replace("@GIT@", actual.trim()),
+                actual.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Command::new(BIN)
+            .args([
+                "--config",
+                self.config.to_str().unwrap(),
+                "run",
+                "--once",
+                "--force",
+            ])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn narrow_discovery_failure_preserves_snapshot_and_noop_skips_download() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    let before: String = f
+        .db()
+        .query_row("SELECT refs FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    let failed = f.wrapped_run(
+        "case \" $* \" in *' ls-remote '*) echo 'sensitive transport error' >&2; exit 128;; esac",
+    );
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("sensitive transport error"));
+    assert_eq!(f.count("events"), 0);
+    let after: String = f
+        .db()
+        .query_row("SELECT refs FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    let noop = f.wrapped_run("case \" $* \" in *' fetch '*) exit 128;; esac");
+    assert!(
+        noop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&noop.stderr)
+    );
+    assert_eq!(f.count("attempts"), 0);
+    // An unrestricted watch uses direct fetch and needs no ls-remote request.
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        text.replace("branches={include=['main']}", "branches={all=true}"),
+    )
+    .unwrap();
+    let full = f.wrapped_run("case \" $* \" in *' ls-remote '*) exit 128;; esac");
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn disappearing_branch_between_discovery_and_download_is_rediscovered() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Racing update");
+    let once = f.root.join("discovered-once");
+    let count = f.root.join("discovery-count");
+    let o = f.wrapped_run(&format!(
+        "case \" $* \" in *' ls-remote '*)\n echo observed >> '{}'\n if [ ! -e '{}' ]; then\n '@GIT@' \"$@\" || exit $?\n touch '{}'\n '@GIT@' -C '{}' update-ref -d refs/heads/main\n exit $?\n fi;; esac",
+        count.display(), once.display(), once.display(), f.remote.display()));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 2);
+    assert_eq!(f.count("events"), 1);
+    let event: String = f
+        .db()
+        .query_row("SELECT body FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<git_monitor::model::EventView>(&event)
+            .unwrap()
+            .kind,
+        "branch_deleted"
+    );
+    let snapshot: String = f
+        .db()
+        .query_row("SELECT refs FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(snapshot, "{}");
+    assert_eq!(f.count("attempts"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_push_during_download_rechecks_the_discovered_oid() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Unpublished racing tip",
+    );
+    git(&f.work, &["checkout", "--orphan", "replacement"]);
+    git(&f.work, &["rm", "-rf", "."]);
+    std::fs::write(f.work.join("test.c"), "int replacement = 7;\n").unwrap();
+    git(&f.work, &["add", "."]);
+    git(&f.work, &["commit", "-qm", "Raced replacement root"]);
+    let replacement = git(&f.work, &["rev-parse", "HEAD"]);
+    git(&f.work, &["push", "-q", "origin", "replacement"]);
+    git(&f.remote, &["update-ref", "-d", "refs/heads/replacement"]);
+    let once = f.root.join("discovered-once");
+    let count = f.root.join("discovery-count");
+    let o = f.wrapped_run(&format!(
+        "case \" $* \" in *' ls-remote '*)\n echo observed >> '{}'\n if [ ! -e '{}' ]; then\n '@GIT@' \"$@\" || exit $?\n touch '{}'\n '@GIT@' -C '{}' update-ref refs/heads/main '{}'\n exit $?\n fi;; esac",
+        count.display(), once.display(), once.display(), f.remote.display(), replacement));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 2);
+    assert_eq!(f.count("events"), 1);
+    let event: String = f
+        .db()
+        .query_row("SELECT body FROM events", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&event).unwrap();
+    assert_eq!(event.kind, "history_rewritten");
+    assert_eq!(event.new.as_deref(), Some(replacement.as_str()));
+    assert!(f.report().contains("Raced replacement root"));
+    assert!(!f.report().contains("Unpublished racing tip"));
+}
+
+#[test]
+fn narrow_plan_unions_independent_watches() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    let extra = text
+        .split("[[watches]]")
+        .nth(1)
+        .unwrap()
+        .replace("id='runtime'", "id='release'")
+        .replace(
+            "branches={include=['main']}",
+            "branches={include=['release/**']}",
+        );
+    std::fs::write(&f.config, format!("{text}\n[[watches]]{extra}")).unwrap();
+    git(
+        &f.work,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "main:refs/heads/release/2",
+            "main:refs/heads/ignored",
+        ],
+    );
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Both scopes");
+    git(
+        &f.work,
+        &["push", "-q", "origin", "main:refs/heads/release/2"],
+    );
+    f.ok();
+    assert_eq!(f.count("events"), 2);
+    assert_eq!(f.count("matches"), 2);
+    let snapshot: String = f
+        .db()
+        .query_row("SELECT refs FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    let refs: std::collections::BTreeMap<String, String> = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(
+        refs.keys().cloned().collect::<Vec<_>>(),
+        ["main", "release/2"]
+    );
+}
+
+#[test]
+fn narrow_publication_checks_old_refs_without_partial_changes() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Transaction conflict",
+    );
+    let (store, id, attempt, backend) = f.begin_attempt();
+    let desired = backend.discover("origin", false).unwrap();
+    backend
+        .download_selected("origin", &attempt.staging_prefix(id), &desired, false)
+        .unwrap();
+    let old_marker = backend.ref_oid(&attempt.marker_ref()).unwrap().unwrap();
+    let marker = backend
+        .write_manifest(b"conflicting transaction".to_vec())
+        .unwrap();
+    // Simulate another writer after the expected old state was recorded.
+    backend
+        .raw(&["update-ref", "refs/remotes/origin/main", &desired["main"]])
+        .unwrap();
+    assert!(backend
+        .publish_selected(
+            "origin",
+            &attempt.published,
+            &desired,
+            &attempt.marker_ref(),
+            &marker,
+            Some(&old_marker)
+        )
+        .is_err());
+    assert_eq!(
+        backend.ref_oid(&attempt.marker_ref()).unwrap().as_deref(),
+        Some(old_marker.as_str())
+    );
+    assert_eq!(backend.refs("origin").unwrap(), desired);
+    assert_eq!(f.count("events"), 0);
+    drop(store);
+}
+
+#[test]
+fn narrow_fetch_observes_only_selected_heads_and_objects() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main', 'release/**'],exclude=['release/private/**']}");
+    git(&f.work, &["checkout", "--orphan", "secret"]);
+    git(&f.work, &["rm", "-rf", "."]);
+    std::fs::write(f.work.join("secret.c"), "int PRIVATE_SOURCE = 42;\n").unwrap();
+    git(&f.work, &["add", "."]);
+    git(&f.work, &["commit", "-qm", "Unwatched root"]);
+    let secret = git(&f.work, &["rev-parse", "HEAD"]);
+    git(
+        &f.work,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "secret",
+            "secret:refs/heads/release/private/test",
+        ],
+    );
+    git(&f.work, &["checkout", "main"]);
+    git(
+        &f.work,
+        &["push", "-q", "origin", "main:refs/heads/release/1"],
+    );
+    f.ok();
+    let (store, id, attempt, backend) = f.begin_attempt();
+    assert_eq!(
+        backend
+            .refs("origin")
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["main", "release/1"]
+    );
+    assert!(
+        backend.raw(&["cat-file", "-e", &secret]).is_err(),
+        "unselected orphan objects must not be downloaded"
+    );
+    assert_eq!(attempt.old.len(), 2);
+    // A no-op observation still has a durable marker, without fetching again.
+    let mut attempt = attempt;
+    let refs = git_monitor::monitor::fetch_attempt(&store, id, &mut attempt, &backend).unwrap();
+    assert_eq!(refs, attempt.old);
+    drop(store);
+    f.ok();
+    assert_eq!(f.count("events"), 0);
+    assert_eq!(
+        git(
+            &backend.path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/git-monitor/fetch/"
+            ]
+        ),
+        ""
+    );
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Selected main update",
+    );
+    f.ok();
+    assert_eq!(f.count("events"), 1);
+    assert!(f.report().contains("Selected main update"));
+}
+
+#[test]
+fn narrow_fetch_records_creation_and_deletion_of_final_branch() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main', 'release/**']}");
+    f.ok();
+    git(
+        &f.work,
+        &["push", "-q", "origin", "main:refs/heads/release/2"],
+    );
+    f.ok();
+    assert_eq!(f.count("events"), 1);
+    git(&f.remote, &["update-ref", "-d", "refs/heads/main"]);
+    git(&f.remote, &["update-ref", "-d", "refs/heads/release/2"]);
+    f.ok();
+    assert_eq!(f.count("events"), 3);
+    let snapshots: String = f
+        .db()
+        .query_row("SELECT refs FROM snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(snapshots, "{}");
+    f.ok();
+    assert_eq!(f.count("events"), 3);
+    assert_eq!(f.count("attempts"), 0);
+}
+
+#[test]
+fn changing_branch_coverage_establishes_baselines_without_false_events() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    git(
+        &f.work,
+        &["push", "-q", "origin", "main:refs/heads/release/2"],
+    );
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Main pending");
+    // Expand from narrow to all: the already existing release ref is a baseline.
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        text.replace("branches={include=['main']}", "branches={all=true}"),
+    )
+    .unwrap();
+    f.ok();
+    assert_eq!(f.count("events"), 1);
+    assert_eq!(f.count("matches"), 1);
+    // Narrowing all back to main must not invent a release branch deletion.
+    f.branches("branches={include=['main']}");
+    f.ok();
+    assert_eq!(f.count("events"), 1);
+    assert!(f.report().contains("Main pending"));
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        text.replace(
+            "branches={include=['main']}",
+            "branches={include=['main','release/**']}",
+        ),
+    )
+    .unwrap();
+    f.ok();
+    assert_eq!(f.count("events"), 1);
+    git(
+        &f.work,
+        &["push", "-q", "origin", "main:refs/heads/release/2"],
+    );
+    f.ok();
+    assert_eq!(f.count("events"), 2);
+}
+
+#[test]
+fn narrow_publication_is_recovered_before_remote_rollback() {
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    let a = git(&f.work, &["rev-parse", "HEAD"]);
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Narrow before crash",
+    );
+    let (store, id, mut attempt, backend) = f.begin_attempt();
+    git_monitor::monitor::fetch_attempt(&store, id, &mut attempt, &backend).unwrap();
+    drop(store); // Simulated crash after publication, before the SQLite transaction.
+    git::rollback(&f.work, &a);
+    f.ok();
+    assert_eq!(f.count("events"), 2);
+    let events: Vec<String> = f
+        .db()
+        .prepare("SELECT body FROM events ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let events: Vec<git_monitor::model::EventView> = events
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(events[0].old.as_deref(), Some(a.as_str()));
+    assert_eq!(events[1].new.as_deref(), Some(a.as_str()));
+    assert_eq!(events[0].new, events[1].old);
+    assert_eq!(f.count("attempts"), 0);
+}
+
+#[test]
+fn unfinished_narrow_download_never_becomes_an_observation() {
+    use git_monitor::store::NarrowObservation;
+    let f = Fixture::new(false);
+    f.branches("branches={include=['main']}");
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Unpublished download",
+    );
+    let (mut store, id, mut attempt, backend) = f.begin_attempt();
+    let desired = backend.discover("origin", false).unwrap();
+    let previous_marker = backend.ref_oid(&attempt.marker_ref()).unwrap();
+    let marker = backend
+        .write_manifest(b"unpublished test manifest".to_vec())
+        .unwrap();
+    attempt.plan = FetchPlan::Selected {
+        observation: Some(NarrowObservation {
+            refs: desired.clone(),
+            marker,
+            previous_marker,
+        }),
+    };
+    store.update_attempt(id, &attempt).unwrap();
+    assert!(backend
+        .download_selected("origin", &attempt.staging_prefix(id), &desired, false)
+        .unwrap());
+    assert!(!git(
+        &backend.path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &attempt.staging_prefix(id)
+        ]
+    )
+    .is_empty());
+    assert_eq!(backend.refs("origin").unwrap(), attempt.published);
+    let before = store.snapshot(&attempt.key).unwrap();
+    assert_eq!(
+        git_monitor::monitor::recover(&mut store, &Shutdown::default()).unwrap(),
+        0
+    );
+    assert_eq!(store.snapshot(&attempt.key).unwrap(), before);
+    assert_eq!(f.count("events"), 0);
+    assert_eq!(
+        git(
+            &backend.path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &attempt.staging_prefix(id)
+            ]
+        ),
+        ""
+    );
+    drop(store);
+    f.ok();
+    assert_eq!(f.count("events"), 1);
 }
 
 #[test]
@@ -277,8 +782,20 @@ fn recovery_precedes_refetch_after_remote_rollback() {
         execution: cfg.execution.clone(),
         limits: cfg.limits.clone(),
         diff: cfg.diff.clone(),
+        plan: FetchPlan::All,
     };
-    store.begin(&attempt).unwrap();
+    let id = store.begin(&attempt).unwrap();
+    // A pending attempt saved by schema 1 has no fetch-plan field.
+    let mut legacy = serde_json::to_value(&attempt).unwrap();
+    legacy.as_object_mut().unwrap().remove("plan");
+    store
+        .db
+        .execute(
+            "UPDATE attempts SET context=? WHERE id=?",
+            rusqlite::params![legacy.to_string(), id],
+        )
+        .unwrap();
+    store.db.execute_batch("PRAGMA user_version=1;").unwrap();
     for oid in attempt.old.values() {
         git.pin(oid).unwrap();
     }
@@ -288,6 +805,12 @@ fn recovery_precedes_refetch_after_remote_rollback() {
     f.ok();
     assert_eq!(f.count("events"), 2);
     assert_eq!(f.count("attempts"), 0);
+    assert_eq!(
+        f.db()
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
 }
 mod git {
     pub fn rollback(work: &std::path::Path, a: &str) {
@@ -718,9 +1241,27 @@ fn smtp_retry_reuses_saved_mime_and_message_id() {
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_then_terminates_fetch_process_group() {
+    check_fetch_shutdown(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_preserves_unpublished_selected_branch_attempt() {
+    check_fetch_shutdown(true);
+}
+
+#[cfg(unix)]
+fn check_fetch_shutdown(selected: bool) {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new(false);
+    if selected {
+        f.branches("branches={include=['main']}");
+    }
     f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "After interrupted fetch",
+    );
     let bin = f.root.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let marker = f.root.join("fetch-started");
@@ -774,5 +1315,5 @@ fn sigterm_drains_then_terminates_fetch_process_group() {
     assert_eq!(f.count("attempts"), 1);
     f.ok();
     assert_eq!(f.count("attempts"), 0);
-    assert_eq!(f.count("events"), 0);
+    assert_eq!(f.count("events"), 1);
 }

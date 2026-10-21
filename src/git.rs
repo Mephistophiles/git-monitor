@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -74,6 +74,22 @@ impl Git {
     pub fn text(&self, args: &[&str]) -> Result<String> {
         String::from_utf8(self.raw(args)?).context("non-UTF-8 Git metadata is unsupported in v0.1")
     }
+    pub fn raw_input(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+        let out = process::run_with_input(
+            self.command().args(args),
+            input,
+            duration(&self.execution.git_timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+        )?;
+        ensure!(
+            out.code == 0,
+            "Git operation failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(out.stdout)
+    }
     pub fn init(&self) -> Result<()> {
         if !self.path.exists() {
             std::fs::create_dir_all(self.path.parent().context("repository parent")?)?;
@@ -99,40 +115,230 @@ impl Git {
     }
     pub fn fetch(&self, remote: &str, bootstrap: bool) -> Result<()> {
         let spec = format!("+refs/heads/*:refs/remotes/{remote}/*");
-        let mut c = self.command();
-        c.args([
-            "fetch",
-            "--atomic",
-            "--prune",
-            "--no-prune-tags",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--no-auto-maintenance",
-            "--no-write-fetch-head",
-            "--porcelain",
-            "--refmap=",
+        self.network(
+            &[
+                "fetch",
+                "--atomic",
+                "--prune",
+                "--no-prune-tags",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--no-write-fetch-head",
+                "--porcelain",
+                "--refmap=",
+                remote,
+                &spec,
+            ],
+            None,
             remote,
-            &spec,
-        ]);
+            bootstrap,
+        )?;
+        Ok(())
+    }
+    fn network(
+        &self,
+        args: &[&str],
+        input: Option<Vec<u8>>,
+        remote: &str,
+        bootstrap: bool,
+    ) -> Result<Vec<u8>> {
+        let mut c = self.command();
+        c.args(args);
         let timeout = if bootstrap {
             &self.execution.bootstrap_timeout
         } else {
             &self.execution.git_timeout
         };
-        let out = process::run(
-            &mut c,
-            duration(timeout)?,
-            self.limits.max_patch_bytes,
-            &self.shutdown,
-            duration(&self.execution.shutdown_grace)?,
-            None,
-        )?;
+        let out = if let Some(input) = input {
+            process::run_with_input(
+                &mut c,
+                input,
+                duration(timeout)?,
+                self.limits.max_patch_bytes,
+                &self.shutdown,
+                duration(&self.execution.shutdown_grace)?,
+            )?
+        } else {
+            process::run(
+                &mut c,
+                duration(timeout)?,
+                self.limits.max_patch_bytes,
+                &self.shutdown,
+                duration(&self.execution.shutdown_grace)?,
+                None,
+            )?
+        };
         // Remote stderr can contain credentials; never copy it into status or logs.
         ensure!(
             out.code == 0,
-            "fetch failed for {remote} (exit {}); check access and Git capabilities",
+            "remote operation failed for {remote} (exit {}); check access and Git capabilities",
             out.code
         );
+        Ok(out.stdout)
+    }
+    pub fn discover(&self, remote: &str, bootstrap: bool) -> Result<BTreeMap<String, String>> {
+        let bytes = self.network(
+            &["ls-remote", "--heads", "--refs", remote],
+            None,
+            remote,
+            bootstrap,
+        )?;
+        let text = String::from_utf8(bytes).context("non-UTF-8 branch names are unsupported")?;
+        let mut refs = BTreeMap::new();
+        for line in text.lines() {
+            let (oid, name) = line.split_once('\t').context("invalid discovery record")?;
+            ensure!(
+                [40, 64].contains(&oid.len()) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid discovery OID"
+            );
+            let name = name
+                .strip_prefix("refs/heads/")
+                .context("unexpected discovery namespace")?;
+            ensure!(
+                !name.is_empty()
+                    && !name
+                        .bytes()
+                        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+                "invalid discovery ref"
+            );
+            refs.insert(name.into(), oid.into());
+        }
+        Ok(refs)
+    }
+    fn missing_commits(&self, refs: &BTreeMap<String, String>) -> Result<BTreeSet<String>> {
+        let oids: BTreeSet<_> = refs.values().cloned().collect();
+        if oids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let input = oids
+            .iter()
+            .map(|oid| format!("{oid}\n"))
+            .collect::<String>();
+        let output = String::from_utf8(self.raw_input(
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input.into_bytes(),
+        )?)?;
+        ensure!(
+            output.lines().count() == oids.len(),
+            "incomplete object availability response"
+        );
+        let mut missing = BTreeSet::new();
+        for (oid, line) in oids.iter().zip(output.lines()) {
+            let (actual, kind) = line
+                .split_once(' ')
+                .context("invalid object availability response")?;
+            ensure!(actual == oid, "unexpected object availability response");
+            match kind {
+                "commit" => {}
+                "missing" => {
+                    missing.insert(oid.clone());
+                }
+                _ => bail!("branch tip is not a commit"),
+            }
+        }
+        Ok(missing)
+    }
+    pub fn download_selected(
+        &self,
+        remote: &str,
+        staging: &str,
+        desired: &BTreeMap<String, String>,
+        bootstrap: bool,
+    ) -> Result<bool> {
+        let missing = self.missing_commits(desired)?;
+        let mut needed = BTreeMap::new();
+        for (name, oid) in desired {
+            if missing.contains(oid) {
+                needed.entry(oid).or_insert(name);
+            }
+        }
+        if !needed.is_empty() {
+            let input = needed
+                .into_values()
+                .map(|name| format!("+refs/heads/{name}:{staging}{}\n", crate::hash(name)))
+                .collect::<String>();
+            self.network(
+                &[
+                    "fetch",
+                    "--atomic",
+                    "--no-prune",
+                    "--no-prune-tags",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-auto-maintenance",
+                    "--no-write-fetch-head",
+                    "--porcelain",
+                    "--refmap=",
+                    "--stdin",
+                    remote,
+                ],
+                Some(input.into_bytes()),
+                remote,
+                bootstrap,
+            )?;
+        }
+        Ok(self.missing_commits(desired)?.is_empty())
+    }
+    pub fn ref_oid(&self, name: &str) -> Result<Option<String>> {
+        let refs = self.text(&["for-each-ref", "--format=%(refname) %(objectname)", name])?;
+        Ok(refs
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .find_map(|(r, oid)| (r == name).then(|| oid.to_owned())))
+    }
+    pub fn write_manifest(&self, bytes: Vec<u8>) -> Result<String> {
+        Ok(
+            String::from_utf8(self.raw_input(&["hash-object", "-w", "--stdin"], bytes)?)?
+                .trim()
+                .into(),
+        )
+    }
+    pub fn publish_selected(
+        &self,
+        remote: &str,
+        old: &BTreeMap<String, String>,
+        desired: &BTreeMap<String, String>,
+        marker_ref: &str,
+        marker: &str,
+        previous_marker: Option<&str>,
+    ) -> Result<()> {
+        let mut input = String::from("start\n");
+        for (name, oid) in old {
+            if !desired.contains_key(name) {
+                input.push_str(&format!("delete refs/remotes/{remote}/{name} {oid}\n"));
+            }
+        }
+        for (branch, oid) in desired {
+            let name = format!("refs/remotes/{remote}/{branch}");
+            if let Some(previous) = old.get(branch) {
+                input.push_str(&format!("update {name} {oid} {previous}\n"));
+            } else {
+                input.push_str(&format!("create {name} {oid}\n"));
+            }
+        }
+        if let Some(previous) = previous_marker {
+            input.push_str(&format!("update {marker_ref} {marker} {previous}\n"));
+        } else {
+            input.push_str(&format!("create {marker_ref} {marker}\n"));
+        }
+        input.push_str("prepare\ncommit\n");
+        self.raw_input(&["update-ref", "--no-deref", "--stdin"], input.into_bytes())?;
+        Ok(())
+    }
+    pub fn cleanup_staging(&self, prefix: &str) -> Result<()> {
+        let refs = self.text(&["for-each-ref", "--format=%(refname) %(objectname)", prefix])?;
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::from("start\n");
+        for line in refs.lines() {
+            let (name, oid) = line.split_once(' ').context("invalid staging ref")?;
+            ensure!(name.starts_with(prefix), "unexpected staging namespace");
+            input.push_str(&format!("delete {name} {oid}\n"));
+        }
+        input.push_str("prepare\ncommit\n");
+        self.raw_input(&["update-ref", "--no-deref", "--stdin"], input.into_bytes())?;
         Ok(())
     }
     pub fn refs(&self, remote: &str) -> Result<BTreeMap<String, String>> {

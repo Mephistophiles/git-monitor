@@ -6,7 +6,7 @@ use crate::{
     model::{CommitView, EventView, FileDiff, Report},
     process::{self, Shutdown},
     render,
-    store::{source_key, Analysis, Attempt, Store, Task},
+    store::{source_key, Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
 };
 use anyhow::{ensure, Context, Result};
 use fs2::FileExt;
@@ -296,13 +296,86 @@ pub fn recover(store: &mut Store, shutdown: &Shutdown) -> Result<usize> {
     for (id, attempt) in store.attempts()? {
         let git = attempt.git(shutdown.clone());
         let refs = git.refs(&attempt.remote)?;
-        if refs == attempt.published {
+        let published = match &attempt.plan {
+            FetchPlan::All => refs != attempt.published,
+            FetchPlan::Selected { observation } => {
+                let complete = if let Some(observation) = observation {
+                    let complete =
+                        git.ref_oid(&attempt.marker_ref())?.as_deref() == Some(&observation.marker);
+                    if complete {
+                        ensure!(
+                            refs == observation.refs,
+                            "published refs disagree with observation manifest"
+                        );
+                    }
+                    complete
+                } else {
+                    false
+                };
+                git.cleanup_staging(&attempt.staging_prefix(id))?;
+                complete
+            }
+        };
+        if !published {
             store.db.execute("DELETE FROM attempts WHERE id=?", [id])?;
         } else {
             count += store.finish(id, &attempt, refs, &git)?;
         }
     }
     Ok(count)
+}
+
+// Keep the confirmed manifest durable before any download or publication. This
+// method deliberately stops before SQLite finalization, which recovery can repeat.
+pub fn fetch_attempt(
+    store: &Store,
+    id: i64,
+    attempt: &mut Attempt,
+    git: &Git,
+) -> Result<BTreeMap<String, String>> {
+    if matches!(attempt.plan, FetchPlan::All) {
+        git.fetch(&attempt.remote, !attempt.initialized)?;
+        return git.refs(&attempt.remote);
+    }
+    let staging = attempt.staging_prefix(id);
+    for _ in 0..3 {
+        git.cleanup_staging(&staging)?;
+        let mut desired = git.discover(&attempt.remote, !attempt.initialized)?;
+        desired.retain(|branch, _| attempt.watches.iter().any(|w| w.branch_matches(branch)));
+        let previous_marker = git.ref_oid(&attempt.marker_ref())?;
+        let marker = git.write_manifest(serde_json::to_vec(&(
+            &attempt.key,
+            id,
+            &desired,
+            &previous_marker,
+        ))?)?;
+        attempt.plan = FetchPlan::Selected {
+            observation: Some(NarrowObservation {
+                refs: desired.clone(),
+                marker: marker.clone(),
+                previous_marker: previous_marker.clone(),
+            }),
+        };
+        store.update_attempt(id, attempt)?;
+        match git.download_selected(&attempt.remote, &staging, &desired, !attempt.initialized) {
+            Ok(true) => {
+                git.publish_selected(
+                    &attempt.remote,
+                    &attempt.published,
+                    &desired,
+                    &attempt.marker_ref(),
+                    &marker,
+                    previous_marker.as_deref(),
+                )?;
+                git.cleanup_staging(&staging)?;
+                return Ok(desired);
+            }
+            Ok(false) | Err(_) if !git.shutdown.requested() => continue,
+            Ok(false) => anyhow::bail!("discovered objects became unavailable"),
+            Err(e) => return Err(e),
+        }
+    }
+    anyhow::bail!("remote changed during discovery/download or download failed; retry on next poll")
 }
 
 pub fn collect(
@@ -361,7 +434,8 @@ pub fn collect(
             for oid in published.values() {
                 git.pin(oid)?;
             }
-            let attempt = Attempt {
+            let plan = FetchPlan::for_watches(&watches);
+            let mut attempt = Attempt {
                 key: key.clone(),
                 repository: repository.clone(),
                 remote: remote.clone(),
@@ -374,15 +448,15 @@ pub fn collect(
                 execution: cfg.execution.clone(),
                 limits: cfg.limits.clone(),
                 diff: cfg.diff.clone(),
+                plan,
             };
             for oid in attempt.old.values() {
                 git.pin(oid)?;
             }
             git.configure_remote(remote, &source.url)?;
             let id = store.begin(&attempt)?;
-            match git.fetch(remote, !attempt.initialized) {
-                Ok(()) => {
-                    let refs = git.refs(remote)?;
+            match fetch_attempt(store, id, &mut attempt, &git) {
+                Ok(refs) => {
                     events += store.finish(id, &attempt, refs, &git)?;
                     eprintln!("checked {repository}/{remote}");
                 }

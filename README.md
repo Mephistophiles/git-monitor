@@ -74,6 +74,10 @@ exclude_paths = ["**/test/**"]
 
 Use `branches = { all = true }` for every branch. `*` does not cross `/`; `**` does. Paths are case-sensitive and relative to the Git tree root. One watch can specify paths, a single function, or neither for all content.
 
+Each remote's fetch plan combines its active watches. An unrestricted all-branch watch uses direct atomic fetch. Otherwise, successful `ls-remote` discovery selects the matching heads, and only missing selected tips are downloaded into temporary refs. The confirmed snapshot and an observation marker are then published in one checked Git transaction. A no-change poll needs discovery but no object download. Shared ancestors of selected branches can still include content from other histories.
+
+Discovery/download races trigger up to three discovery attempts before the normal failure backoff. Failed discovery and unfinished downloads never establish branch absence. Adding branch scopes establishes their baseline; removing a scope does not create a deletion event.
+
 ```toml
 function = { path = "compiler-rt/lib/asan/asan_thread.cpp", match = "ThreadStart" }
 ```
@@ -107,6 +111,7 @@ MIME bytes and Message-ID are persisted before SMTP. Ambiguous attempts retain t
 
 - Each logical repository has a managed bare cache; each remote/source epoch has an independent snapshot.
 - Persisted fetch attempts are recovered **before another fetch**. The `A → B → crash → A` case retains both observed transitions.
+- Selected-branch recovery requires the committed observation marker; temporary download refs alone cannot create events. Temporary refs are removed after publication or recovery.
 - Commits are enumerated with `rev-list`; each uses `git show --diff-merges=first-parent`, including conflict-resolution changes.
 - Identical selected old/new analyses are cached independently of watch names and recipient addresses. Event bindings remain separate.
 - Configuration is read once per process. Apply edits by stopping and restarting. SIGTERM/SIGINT stops new work, drains active work within `shutdown_grace`, and leaves unfinished jobs recoverable. SIGHUP is ignored.
@@ -119,6 +124,8 @@ git-monitor --config examples/monitor.toml run --once --force
 ```
 
 Do not share a managed repository directory between unrelated state directories. Repository locks guard active caches. Object pins are intentionally retained in v0.1; automatic pin/cache retention and maintenance are not implemented yet.
+
+State databases upgrade automatically from schema 1 to 2 when opened by this version. Older binaries reject schema 2, preventing them from misinterpreting unfinished selected-branch attempts.
 
 ## Diff engine
 
@@ -135,12 +142,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets --locked
 cargo build --release --locked
-cargo bench --bench baseline -- --save-baseline baseline-v0
+cargo bench --bench baseline -- --save-baseline my-run
+python3 scripts/record-baseline.py --name my-run
 ```
 
-Integration tests create local Git repositories and a local SMTP fixture. They cover bootstrap/no-op behavior, multiple remotes, shared analysis, force-push/rollback, crash recovery, branch deletion, function scope, deletion/restoration, attributes, merge resolution, MIME limits, durable SMTP retries, hostile HTML, and bounded SIGTERM shutdown.
+Integration tests create local Git repositories and a local SMTP fixture. They cover bootstrap/no-op behavior, multiple remotes, shared analysis, force-push/rollback, crash recovery, branch deletion, function scope, deletion/restoration, attributes, merge resolution, MIME limits, durable SMTP retries, hostile HTML, and bounded SIGTERM shutdown. Selected-branch cases additionally check excluded orphan objects, combined watches, coverage changes, empty observations, discovery/download races, incomplete staging, and atomic publication conflicts.
 
 Criterion includes native text/syntax comparisons and an incremental **fetch → analysis → HTML → MIME** pass using local transport and `--prepare-only`. Fixture creation and the initial baseline fetch are outside that measurement. [benchmarks/baselines](benchmarks/baselines) records initial results and their environment; these are observations from one host, not performance guarantees.
+
+The end-to-end suite measures both all-branch and selected-branch fetch on the same one-branch history. Selected discovery/publication adds fixed work on this small fixture; its purpose is to avoid downloading unrelated tips on larger remotes. Tests verify that behavior separately; these measurements do not claim network transfer savings.
 
 To regenerate screenshots and browser checks:
 
@@ -154,6 +164,6 @@ The browser checks side-by-side switching, themes, search, no-JS readability, an
 
 ## v0.1 boundaries
 
-This is the first executable implementation of [ARCHITECTURE.md](ARCHITECTURE.md), not every planned optimization. Fetch and analysis are currently serialized. All heads of a selected remote are fetched, while watches filter analysis and reports; narrow discovery/fetch plans are not implemented. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Oversized single-line byte-chunk delivery and automatic retention are deferred.
+This is the first executable implementation of [ARCHITECTURE.md](ARCHITECTURE.md), not every planned optimization. Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Oversized single-line byte-chunk delivery and automatic retention are deferred.
 
 Licensed under [MIT](LICENSE).

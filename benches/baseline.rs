@@ -42,7 +42,7 @@ fn baseline(c: &mut Criterion) {
     });
 }
 
-fn incremental_fixture() -> tempfile::TempDir {
+fn incremental_fixture(branches: &str) -> tempfile::TempDir {
     use std::process::{Command, Stdio};
     let root = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
@@ -64,7 +64,7 @@ fn incremental_fixture() -> tempfile::TempDir {
     std::fs::write(root.path().join("source.c"), "int value = 1;\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-qm", "Initial"]);
-    let cfg = format!("version=1\n[storage]\nrepositories_dir='cache'\nstate_dir='state'\n[defaults]\ndigest_every='0s'\n[recipients.bench]\nto=['bench@example.invalid']\n[repositories.bench.remotes.origin]\nurl='{}'\n[[watches]]\nid='bench'\nrepository='bench'\nremotes=['origin']\nrecipients=['bench']\nbranches={{all=true}}\npaths=['*.c']\n", root.path().display());
+    let cfg = format!("version=1\n[storage]\nrepositories_dir='cache'\nstate_dir='state'\n[defaults]\ndigest_every='0s'\n[recipients.bench]\nto=['bench@example.invalid']\n[repositories.bench.remotes.origin]\nurl='{}'\n[[watches]]\nid='bench'\nrepository='bench'\nremotes=['origin']\nrecipients=['bench']\nbranches={branches}\npaths=['*.c']\n", root.path().display());
     std::fs::write(root.path().join("monitor.toml"), cfg).unwrap();
     std::fs::write(root.path().join("mail.toml"), "version=1\n[smtp]\nhost='localhost'\nport=2525\nsecurity='none'\nfrom='bench@example.invalid'\ntimeout='1s'\n").unwrap();
     run_pass(root.path());
@@ -105,7 +105,17 @@ fn end_to_end(c: &mut Criterion) {
         .measurement_time(std::time::Duration::from_secs(2));
     group.bench_function("incremental_fetch_to_mime", |b| {
         b.iter_batched(
-            incremental_fixture,
+            || incremental_fixture("{all=true}"),
+            |root| {
+                run_pass(root.path());
+                black_box(root)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("incremental_selected_fetch_to_mime", |b| {
+        b.iter_batched(
+            || incremental_fixture("{include=['main']}"),
             |root| {
                 run_pass(root.path());
                 black_box(root)

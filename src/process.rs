@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::{
-    io::Read,
+    io::{Read, Write},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -57,9 +57,36 @@ pub fn run(
     grace: Duration,
     memory: Option<u64>,
 ) -> Result<Output> {
+    run_inner(command, timeout, limit, shutdown, grace, memory, None)
+}
+
+pub fn run_with_input(
+    command: &mut Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    limit: usize,
+    shutdown: &Shutdown,
+    grace: Duration,
+) -> Result<Output> {
+    run_inner(command, timeout, limit, shutdown, grace, None, Some(input))
+}
+
+fn run_inner(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    shutdown: &Shutdown,
+    grace: Duration,
+    memory: Option<u64>,
+    input: Option<Vec<u8>>,
+) -> Result<Output> {
     let group = std::env::var_os("GIT_MONITOR_WORKER").is_none();
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -88,6 +115,10 @@ pub fn run(
         bail!("worker address-space limit is unsupported on this platform");
     }
     let mut child = command.spawn().context("start child process")?;
+    let writer = input.map(|bytes| {
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::spawn(move || stdin.write_all(&bytes))
+    });
     let exceeded = Arc::new(AtomicBool::new(false));
     fn reader<R: Read + Send + 'static>(
         mut r: R,
@@ -145,11 +176,20 @@ pub fn run(
     let stderr = err
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    let written = writer.map(|w| {
+        w.join()
+            .map_err(|_| anyhow::anyhow!("stdin writer panicked"))
+    });
     if let Some(reason) = failure {
         bail!("{reason}");
     }
     if exceeded.load(Ordering::Relaxed) {
         bail!("process output budget exceeded");
+    }
+    if status.success() {
+        if let Some(result) = written {
+            result??;
+        }
     }
     Ok(Output {
         code: status.code().unwrap_or(-1),

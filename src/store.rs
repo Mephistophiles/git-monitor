@@ -26,6 +26,45 @@ pub struct Attempt {
     pub execution: Execution,
     pub limits: Limits,
     pub diff: DiffConfig,
+    #[serde(default)]
+    pub plan: FetchPlan,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FetchPlan {
+    #[default]
+    All,
+    Selected {
+        observation: Option<NarrowObservation>,
+    },
+}
+impl FetchPlan {
+    pub fn for_watches(watches: &[Watch]) -> Self {
+        if watches
+            .iter()
+            .any(|w| w.branches.all && w.branches.exclude.is_empty())
+        {
+            Self::All
+        } else {
+            Self::Selected { observation: None }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NarrowObservation {
+    pub refs: BTreeMap<String, String>,
+    pub marker: String,
+    pub previous_marker: Option<String>,
+}
+impl Attempt {
+    pub fn marker_ref(&self) -> String {
+        format!("refs/git-monitor/observations/{}", self.key)
+    }
+    pub fn staging_prefix(&self, id: i64) -> String {
+        format!("refs/git-monitor/fetch/{}/{id}/", self.key)
+    }
 }
 impl Attempt {
     pub fn git(&self, shutdown: Shutdown) -> Git {
@@ -79,7 +118,7 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 1, "state database is newer than this binary");
+        ensure!(version <= 2, "state database is newer than this binary");
         db.execute_batch("BEGIN;
           CREATE TABLE IF NOT EXISTS snapshots(key TEXT PRIMARY KEY, refs TEXT NOT NULL, watches TEXT NOT NULL, checked INTEGER NOT NULL, error TEXT);
           CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, context TEXT NOT NULL);
@@ -90,7 +129,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS matches(id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL, watch_id TEXT NOT NULL, recipient TEXT NOT NULL, source_key TEXT NOT NULL, watch TEXT NOT NULL, body TEXT NOT NULL, digest TEXT, UNIQUE(event_id,watch_id,recipient));
           CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, revision TEXT NOT NULL, digest TEXT NOT NULL, mime BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
           CREATE TABLE IF NOT EXISTS clocks(recipient TEXT PRIMARY KEY, last_digest INTEGER NOT NULL);
-          PRAGMA user_version=1; COMMIT;")?;
+          PRAGMA user_version=2; COMMIT;")?;
         // A single instance owns the DB; any running jobs were interrupted.
         db.execute("UPDATE jobs SET state='pending' WHERE state='running'", [])?;
         db.execute(
@@ -130,6 +169,16 @@ impl Store {
             .map(|(id, s)| Ok((id, serde_json::from_str(&s)?)))
             .collect()
     }
+    pub fn update_attempt(&self, id: i64, a: &Attempt) -> Result<()> {
+        ensure!(
+            self.db.execute(
+                "UPDATE attempts SET context=? WHERE id=? AND key=?",
+                params![serde_json::to_string(a)?, id, a.key]
+            )? == 1,
+            "fetch attempt disappeared"
+        );
+        Ok(())
+    }
     pub fn finish(
         &mut self,
         id: i64,
@@ -141,6 +190,12 @@ impl Store {
         if a.initialized {
             let names: BTreeSet<_> = a.old.keys().chain(new.keys()).cloned().collect();
             for branch in names {
+                // Added scopes start at a baseline; removed scopes are not deletions.
+                if !a.watches.iter().any(|w| w.branch_matches(&branch))
+                    || !a.previous.values().any(|w| w.branch_matches(&branch))
+                {
+                    continue;
+                }
                 let old = a.old.get(&branch).cloned();
                 let next = new.get(&branch).cloned();
                 if old == next {

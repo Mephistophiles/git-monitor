@@ -37,7 +37,7 @@ cpu = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read
 manifest = {
     "baseline": args.name,
     "application_version": "0.1.0",
-    "source_state": "pre-commit initial implementation; identified by source_sha256",
+    "source_state": "working tree; identified by source_sha256",
     "source_sha256": source_hash.hexdigest(),
     "cargo_lock_sha256": hashlib.sha256((root / "Cargo.lock").read_bytes()).hexdigest(),
     "rustc": output("rustc", "-Vv"),
@@ -63,7 +63,7 @@ for name, result in results.items():
     rows.append(f"| {name} | {estimate:.3f} ms | {interval['lower_bound']/1e6:.3f}–{interval['upper_bound']/1e6:.3f} ms |")
 summary = f"""# {args.name}
 
-Initial measurements for v0.1.0. These are observations on one host, not performance guarantees.
+Measurements for v0.1.0. These are observations on one host, not performance guarantees.
 
 | Scenario | Mean | 95% confidence interval |
 | --- | --- | --- |
