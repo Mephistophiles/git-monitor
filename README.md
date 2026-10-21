@@ -168,6 +168,21 @@ The browser checks side-by-side switching, themes, search, no-JS readability, an
 
 ## v0.1 boundaries
 
+Analysis cache identities include the Git version, dependency lockfile, analyzer
+source identity, model version, and explicitly allowed function rules. Local
+analysis ignores global Git diff settings; transport still uses standard SSH and
+credential helpers. Custom textual rules are configured as
+`execution.diff_drivers = { custom = '^FUNCTION .*' }` and are frozen per run.
+File patches honor `diff.context_lines`.
+
+Set `repositories.<id>.object_format = 'sha256'` for SHA-256 sources (default:
+`sha1`). All remotes in a logical repository must share the format. A remote's
+optional nonsecret `access_context` identifies its credential/visibility context;
+rotate it when that context changes. Source changes, including a later return to
+an earlier context, establish a fresh epoch and baseline. `doctor` performs
+offline capability probes, storage write checks, worker-limit and queue-integrity
+checks without contacting configured remotes or SMTP.
+
 This is the first executable implementation of [ARCHITECTURE.md](ARCHITECTURE.md), not every planned optimization. Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Oversized single-line byte-chunk delivery and automatic retention are deferred.
 
 Licensed under [MIT](LICENSE).

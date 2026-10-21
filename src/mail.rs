@@ -76,13 +76,14 @@ pub fn revision(c: &Config, id: &str, mail: &MailConfig) -> String {
                     c.repositories
                         .get(&w.repository)
                         .and_then(|r| r.remotes.get(remote))
-                        .map(|r| &r.url),
+                        .map(|r| (&r.url, &r.access_context)),
                 )
             })
         })
         .collect();
     crate::hash(
         serde_json::to_vec(&(
+            crate::profile::render_key(),
             c.recipients.get(id),
             c.watches
                 .iter()

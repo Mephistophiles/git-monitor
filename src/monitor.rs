@@ -6,7 +6,7 @@ use crate::{
     model::{CommitView, EventView, FileDiff, Report},
     process::{self, Shutdown},
     render,
-    store::{source_key, Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
+    store::{Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
 };
 use anyhow::{ensure, Context, Result};
 use fs2::FileExt;
@@ -211,7 +211,7 @@ fn selected(
                     return Ok(f);
                 }
                 let patch = if commit_patch {
-                    git.show_patch(new, &change.path)?
+                    git.show_patch(new, &change.path, task.diff.context_lines)?
                 } else {
                     git.raw(&[
                         "diff",
@@ -220,7 +220,7 @@ fn selected(
                         "--no-ext-diff",
                         "--no-textconv",
                         "--diff-algorithm=histogram",
-                        "--unified=3",
+                        &format!("--unified={}", task.diff.context_lines),
                         old.context("aggregate diff needs an old revision")?,
                         new,
                         "--",
@@ -402,7 +402,7 @@ pub fn collect(
             limits: cfg.limits.clone(),
             shutdown: shutdown.clone(),
         };
-        git.init()?;
+        git.init_format(&r.object_format)?;
         for (remote, source) in &r.remotes {
             if shutdown.requested() {
                 break;
@@ -416,7 +416,11 @@ pub fn collect(
             if watches.is_empty() {
                 continue;
             }
-            let key = source_key(repository, remote, &source.url);
+            let key = store.activate_source(
+                repository,
+                remote,
+                &crate::store::source_identity(repository, remote, source),
+            )?;
             let snapshot = store.snapshot(&key)?;
             let interval = duration(
                 source
@@ -494,6 +498,11 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
             break;
         }
         let key = crate::hash(serde_json::to_vec(&(
+            if cfg.execution.analysis_profile.git.is_empty() {
+                crate::profile::AnalysisProfile::freeze(&cfg.execution.diff_drivers)?.key()
+            } else {
+                cfg.execution.analysis_profile.key()
+            },
             &task.event.repository,
             &task.path,
             &task.event.old,
@@ -568,7 +577,13 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
     Ok(analyses)
 }
 
-fn allowed(cfg: &Config, watch: &Watch, event: &EventView, key: &str) -> Option<Watch> {
+fn allowed(
+    cfg: &Config,
+    store: &Store,
+    watch: &Watch,
+    event: &EventView,
+    key: &str,
+) -> Option<Watch> {
     let current = cfg.watches.iter().find(|w| {
         w.id == watch.id
             && w.repository == event.repository
@@ -588,7 +603,16 @@ fn allowed(cfg: &Config, watch: &Watch, event: &EventView, key: &str) -> Option<
         .get(&event.repository)?
         .remotes
         .get(&event.remote)?;
-    (source_key(&event.repository, &event.remote, &source.url) == key).then(|| current.clone())
+    (store
+        .active_source(
+            &event.repository,
+            &event.remote,
+            &crate::store::source_identity(&event.repository, &event.remote, source),
+        )
+        .ok()?
+        .as_str()
+        == key)
+        .then(|| current.clone())
 }
 
 pub fn report(
@@ -606,7 +630,7 @@ pub fn report(
         pending_only,
         cfg.limits.max_job_output_bytes,
         |m| {
-            if let Some(w) = allowed(cfg, &m.watch, &m.event, &m.key)
+            if let Some(w) = allowed(cfg, store, &m.watch, &m.event, &m.key)
                 .filter(|w| w.recipients.iter().any(|r| r == recipient))
             {
                 scopes.insert(m.id, w);

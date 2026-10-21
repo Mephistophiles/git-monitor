@@ -809,7 +809,7 @@ fn recovery_precedes_refetch_after_remote_rollback() {
         f.db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 mod git {
@@ -1497,6 +1497,183 @@ fn config_rejects_bad_ids_and_conflicting_selectors() {
     let mut c = Config::load(&f.config).unwrap();
     c.watches[0].paths = Some(vec!["*.c".into()]);
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn profile_identity_covers_versions_and_allowed_driver_rules() {
+    let p = git_monitor::profile::AnalysisProfile::freeze(&Default::default()).unwrap();
+    assert!(!p.git.is_empty());
+    for field in ["git", "analyzer", "dependencies", "drivers", "model"] {
+        let mut next = p.clone();
+        match field {
+            "git" => next.git.push_str(" changed"),
+            "analyzer" => next.analyzer.push('1'),
+            "dependencies" => next.dependencies.push('1'),
+            "drivers" => {
+                next.drivers.insert("custom".into(), "^FUNC".into());
+            }
+            _ => next.model += 1,
+        }
+        assert_ne!(p.key(), next.key(), "{field}");
+    }
+}
+
+#[test]
+fn doctor_checks_existing_queue_integrity_without_network() {
+    let f = Fixture::new(false);
+    f.ok();
+    let check = || {
+        Command::new(BIN)
+            .arg("--config")
+            .arg(&f.config)
+            .arg("doctor")
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("queue integrity OK"));
+    f.db()
+        .execute(
+            "INSERT INTO jobs(event_id,watch_id,task) VALUES(999999,'orphan','{}')",
+            [],
+        )
+        .unwrap();
+    let output = check();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("orphaned analysis jobs"));
+}
+
+#[test]
+fn global_function_rules_do_not_override_frozen_analysis() {
+    let f = Fixture::new(true);
+    std::fs::write(f.work.join(".gitattributes"), "*.c diff=cpp\n").unwrap();
+    f.change(BEFORE, "Set built-in function rules");
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Frozen rules");
+    let global = f.root.join("host.gitconfig");
+    std::fs::write(&global, "[diff \"cpp\"]\n  xfuncname = ^NOT_A_FUNCTION$\n").unwrap();
+    let output = Command::new(BIN)
+        .arg("--config")
+        .arg(&f.config)
+        .args(["run", "--once", "--force"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(f.report().contains("Frozen rules"));
+    assert!(!f.report().contains("analysis_failed"));
+}
+
+#[test]
+fn configured_file_context_is_respected() {
+    let f = Fixture::new(false);
+    f.ok();
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(&f.config, format!("{text}\n[diff]\ncontext_lines=0\n")).unwrap();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Zero context");
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert!(!event.commits[0].files[0]
+        .rows
+        .iter()
+        .any(|r| r.kind == "context"));
+}
+
+#[test]
+fn source_context_rotation_and_return_create_fresh_epochs() {
+    let f = Fixture::new(false);
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let remote = cfg.repositories["project"].remotes["origin"].clone();
+    let identity = git_monitor::store::source_identity("project", "origin", &remote);
+    let a = store.active_source("project", "origin", &identity).unwrap();
+    cfg.repositories
+        .get_mut("project")
+        .unwrap()
+        .remotes
+        .get_mut("origin")
+        .unwrap()
+        .access_context = "restricted".into();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Context change baseline",
+    );
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true)
+            .unwrap()
+            .0,
+        0
+    );
+    cfg.repositories
+        .get_mut("project")
+        .unwrap()
+        .remotes
+        .get_mut("origin")
+        .unwrap()
+        .access_context
+        .clear();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_ne!(
+        store.active_source("project", "origin", &identity).unwrap(),
+        a
+    );
+}
+
+#[test]
+fn sha256_git_cache_matches_the_configured_object_format() {
+    let f = Fixture::new(false);
+    let source = f.root.join("sha256.git");
+    git(
+        &f.root,
+        &[
+            "init",
+            "--bare",
+            "--object-format=sha256",
+            "-q",
+            source.to_str().unwrap(),
+        ],
+    );
+    git(&source, &["config", "user.name", "Test"]);
+    git(&source, &["config", "user.email", "test@example.invalid"]);
+    let tree = git(&source, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+    let oid = git(&source, &["commit-tree", &tree, "-m", "SHA256"]);
+    git(&source, &["update-ref", "refs/heads/main", &oid]);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[repositories.project.remotes.origin]",
+            "[repositories.project]\nobject_format='sha256'\n[repositories.project.remotes.origin]",
+        )
+        .replace(f.remote.to_str().unwrap(), source.to_str().unwrap());
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    assert_eq!(oid.len(), 64);
+    assert_eq!(
+        git(
+            &f.root.join("repos/project.git"),
+            &["rev-parse", "--show-object-format"]
+        ),
+        "sha256"
+    );
 }
 
 #[test]

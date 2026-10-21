@@ -112,6 +112,15 @@ pub type Snapshot = (BTreeMap<String, String>, BTreeMap<String, Watch>, u64);
 pub fn source_key(repository: &str, remote: &str, url: &str) -> String {
     crate::hash(format!("{repository}\0{remote}\0{url}"))
 }
+pub fn source_identity(repository: &str, remote: &str, source: &crate::config::Remote) -> String {
+    if source.access_context.is_empty() {
+        source_key(repository, remote, &source.url)
+    } else {
+        crate::hash(
+            serde_json::to_vec(&(repository, remote, &source.url, &source.access_context)).unwrap(),
+        )
+    }
+}
 
 impl Store {
     pub fn open(state: &Path) -> Result<Self> {
@@ -122,7 +131,7 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 2, "state database is newer than this binary");
+        ensure!(version <= 3, "state database is newer than this binary");
         db.execute_batch("BEGIN;
           CREATE TABLE IF NOT EXISTS snapshots(key TEXT PRIMARY KEY, refs TEXT NOT NULL, watches TEXT NOT NULL, checked INTEGER NOT NULL, error TEXT);
           CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, context TEXT NOT NULL);
@@ -133,7 +142,8 @@ impl Store {
           CREATE TABLE IF NOT EXISTS matches(id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL, watch_id TEXT NOT NULL, recipient TEXT NOT NULL, source_key TEXT NOT NULL, watch TEXT NOT NULL, body TEXT NOT NULL, digest TEXT, UNIQUE(event_id,watch_id,recipient));
           CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, revision TEXT NOT NULL, digest TEXT NOT NULL, mime BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
           CREATE TABLE IF NOT EXISTS clocks(recipient TEXT PRIMARY KEY, last_digest INTEGER NOT NULL);
-          PRAGMA user_version=2; COMMIT;")?;
+          CREATE TABLE IF NOT EXISTS active_sources(repository TEXT NOT NULL, remote TEXT NOT NULL, identity TEXT NOT NULL, key TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(repository,remote));
+          PRAGMA user_version=3; COMMIT;")?;
         // A single instance owns the DB; any running jobs were interrupted.
         db.execute("UPDATE jobs SET state='pending' WHERE state='running'", [])?;
         db.execute(
@@ -153,6 +163,46 @@ impl Store {
             .optional()?;
         row.map(|(r, w, t)| Ok((serde_json::from_str(&r)?, serde_json::from_str(&w)?, t)))
             .transpose()
+    }
+    pub fn activate_source(
+        &self,
+        repository: &str,
+        remote: &str,
+        identity: &str,
+    ) -> Result<String> {
+        let old: Option<(String, String, i64)> = self
+            .db
+            .query_row(
+                "SELECT identity,key,epoch FROM active_sources WHERE repository=? AND remote=?",
+                params![repository, remote],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((previous, key, _)) = &old {
+            if previous == identity {
+                return Ok(key.clone());
+            }
+        }
+        let epoch = old.map_or(0, |(_, _, epoch)| epoch + 1);
+        let key = if epoch == 0 {
+            identity.to_owned()
+        } else {
+            crate::hash(format!("{identity}\0{epoch}"))
+        };
+        self.db.execute("INSERT INTO active_sources VALUES(?,?,?,?,?) ON CONFLICT(repository,remote) DO UPDATE SET identity=excluded.identity,key=excluded.key,epoch=excluded.epoch",
+            params![repository,remote,identity,key,epoch])?;
+        Ok(key)
+    }
+    pub fn active_source(&self, repository: &str, remote: &str, identity: &str) -> Result<String> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT key FROM active_sources WHERE repository=? AND remote=? AND identity=?",
+                params![repository, remote, identity],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| identity.to_owned()))
     }
     pub fn begin(&self, a: &Attempt) -> Result<i64> {
         self.db.execute("INSERT INTO remote_status(key,repository,remote,last_attempt,next_poll) VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET last_attempt=excluded.last_attempt,next_poll=excluded.next_poll",params![a.key,a.repository,a.remote,crate::now(),crate::now()+1])?;

@@ -40,6 +40,11 @@ pub struct Execution {
     pub git_timeout: String,
     pub bootstrap_timeout: String,
     pub shutdown_grace: String,
+    /// Explicitly permitted textual Git function-boundary rules.
+    #[serde(default)]
+    pub diff_drivers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub analysis_profile: crate::profile::AnalysisProfile,
 }
 impl Default for Execution {
     fn default() -> Self {
@@ -50,6 +55,8 @@ impl Default for Execution {
             git_timeout: "3m".into(),
             bootstrap_timeout: "30m".into(),
             shutdown_grace: "60s".into(),
+            diff_drivers: BTreeMap::new(),
+            analysis_profile: Default::default(),
         }
     }
 }
@@ -136,12 +143,20 @@ pub struct Recipient {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Repository {
+    #[serde(default = "default_object_format")]
+    pub object_format: String,
     pub remotes: BTreeMap<String, Remote>,
+}
+fn default_object_format() -> String {
+    "sha1".into()
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Remote {
     pub url: String,
     pub poll_every: Option<String>,
+    /// Nonsecret identity of the credentials/visibility context. Rotate when access changes.
+    #[serde(default)]
+    pub access_context: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Watch {
@@ -232,6 +247,11 @@ impl Watch {
     }
 }
 impl Config {
+    pub fn freeze(&mut self) -> Result<()> {
+        self.execution.analysis_profile =
+            crate::profile::AnalysisProfile::freeze(&self.execution.diff_drivers)?;
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -249,6 +269,18 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.execution.max_fetches > 0
+                && self.execution.max_fetches_per_host > 0
+                && self.execution.max_analyses > 0,
+            "concurrency limits must be positive"
+        );
+        for (name, expression) in &self.execution.diff_drivers {
+            ensure!(
+                valid_id(name) && !expression.is_empty() && !expression.contains('\0'),
+                "invalid allowed diff driver"
+            );
+        }
         ensure!(self.version == 1, "unsupported configuration version");
         ensure!(
             self.defaults.new_branch_mode == "summary",
@@ -303,6 +335,10 @@ impl Config {
         );
         for (id, r) in &self.repositories {
             ensure!(valid_id(id), "invalid repository ID");
+            ensure!(
+                ["sha1", "sha256"].contains(&r.object_format.as_str()),
+                "unsupported repository object format"
+            );
             for (id, r) in &r.remotes {
                 ensure!(valid_id(id), "invalid remote ID");
                 ensure!(

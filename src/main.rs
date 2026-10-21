@@ -94,7 +94,7 @@ fn entry() -> Result<()> {
         let to: Vec<String> = serde_json::from_str(&std::env::var("GIT_MONITOR_TO")?)?;
         return mail::smtp_send(&smtp, &to, &std::fs::read(message)?);
     }
-    let cfg = Config::load(&cli.config)?;
+    let mut cfg = Config::load(&cli.config)?;
     let mail = cli
         .mail_config
         .as_ref()
@@ -110,9 +110,10 @@ fn entry() -> Result<()> {
         return Ok(());
     }
     if matches!(cli.command, Action::Doctor) {
-        println!("{}", monitor::doctor()?);
+        println!("{}", git_monitor::doctor::check(&cfg)?);
         return Ok(());
     }
+    cfg.freeze()?;
     let _locks = Locks::acquire(&cfg)?;
     let mut store = Store::open(&cfg.storage.state_dir)?;
     let shutdown = Shutdown::install()?;

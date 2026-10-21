@@ -1,10 +1,12 @@
 pub mod config;
 pub mod diff;
+pub mod doctor;
 pub mod git;
 pub mod mail;
 pub mod model;
 pub mod monitor;
 pub mod process;
+pub mod profile;
 pub mod render;
 pub mod store;
 

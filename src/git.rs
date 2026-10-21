@@ -33,6 +33,9 @@ pub struct Selection {
 
 impl Git {
     fn command(&self) -> Command {
+        self.command_for(false)
+    }
+    fn command_for(&self, network: bool) -> Command {
         let mut c = Command::new("git");
         c.arg("--no-pager")
             .arg("--literal-pathspecs")
@@ -53,6 +56,17 @@ impl Git {
             .env("LC_ALL", "C")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1");
+        if !network {
+            c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_DIFF_OPTS")
+                .env_remove("GIT_EXTERNAL_DIFF")
+                .env_remove("GIT_ATTR_SOURCE");
+        }
+        for (driver, expression) in &self.execution.diff_drivers {
+            c.args(["-c", &format!("diff.{driver}.xfuncname={expression}")]);
+        }
         c
     }
     pub fn raw(&self, args: &[&str]) -> Result<Vec<u8>> {
@@ -91,10 +105,19 @@ impl Git {
         Ok(out.stdout)
     }
     pub fn init(&self) -> Result<()> {
+        self.init_format("sha1")
+    }
+    pub fn init_format(&self, format: &str) -> Result<()> {
         if !self.path.exists() {
             std::fs::create_dir_all(self.path.parent().context("repository parent")?)?;
             let mut c = Command::new("git");
-            c.args(["init", "--bare", "--quiet"]).arg(&self.path);
+            c.args([
+                "init",
+                "--bare",
+                "--quiet",
+                &format!("--object-format={format}"),
+            ])
+            .arg(&self.path);
             let out = process::run(
                 &mut c,
                 duration(&self.execution.git_timeout)?,
@@ -105,6 +128,10 @@ impl Git {
             )?;
             ensure!(out.code == 0, "git init failed");
         }
+        ensure!(
+            self.text(&["rev-parse", "--show-object-format"])?.trim() == format,
+            "managed repository object format differs from configuration"
+        );
         self.raw(&["config", "gc.auto", "0"])?;
         self.raw(&["config", "maintenance.auto", "false"])?;
         Ok(())
@@ -143,7 +170,7 @@ impl Git {
         remote: &str,
         bootstrap: bool,
     ) -> Result<Vec<u8>> {
-        let mut c = self.command();
+        let mut c = self.command_for(true);
         c.args(args);
         let timeout = if bootstrap {
             &self.execution.bootstrap_timeout
@@ -457,7 +484,7 @@ impl Git {
         }
         Ok(result)
     }
-    pub fn show_patch(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
+    pub fn show_patch(&self, commit: &str, path: &str, context: usize) -> Result<Vec<u8>> {
         self.raw(&[
             "show",
             "--format=",
@@ -468,7 +495,7 @@ impl Git {
             "--no-ext-diff",
             "--no-textconv",
             "--diff-algorithm=histogram",
-            "--unified=3",
+            &format!("--unified={context}"),
             commit,
             "--",
             path,
