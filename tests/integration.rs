@@ -2119,3 +2119,48 @@ fn check_fetch_shutdown(selected: bool, orphan: bool) {
     assert_eq!(f.count("attempts"), 0);
     assert_eq!(f.count("events"), 1);
 }
+
+#[test]
+fn immutable_cache_reuses_objects_and_never_caches_refs() {
+    let f = Fixture::new(false);
+    f.ok();
+    let oid = git(&f.work, &["rev-parse", "HEAD"]);
+    let cfg = Config::load(&f.config).unwrap();
+    let mut repository = Git {
+        path: repository_path(&cfg.storage.repositories_dir, "project"),
+        execution: cfg.execution,
+        limits: cfg.limits,
+        shutdown: Shutdown::default(),
+    };
+    git_monitor::metrics::reset();
+    let first = repository.metadata(&oid).unwrap();
+    let operations = git_monitor::metrics::snapshot().git_processes;
+    assert_eq!(first, repository.metadata(&oid).unwrap());
+    assert_eq!(git_monitor::metrics::snapshot().git_processes, operations);
+    repository.refs("origin").unwrap();
+    repository.refs("origin").unwrap();
+    assert!(git_monitor::metrics::snapshot().git_processes >= operations + 2);
+    repository.execution.share_computations = false;
+    repository.metadata(&oid).unwrap();
+    assert!(git_monitor::metrics::snapshot().git_processes > operations + 2);
+}
+#[test]
+fn shared_analysis_has_the_same_content_as_naive_analysis() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Shared computation",
+    );
+    let cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    let (_, mut task) = store.jobs().unwrap().remove(0);
+    let shared = git_monitor::monitor::analyze(&task).unwrap();
+    task.execution.share_computations = false;
+    let naive = git_monitor::monitor::analyze(&task).unwrap();
+    assert_eq!(
+        serde_json::to_value(&shared.commits).unwrap(),
+        serde_json::to_value(&naive.commits).unwrap()
+    );
+}

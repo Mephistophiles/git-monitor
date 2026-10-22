@@ -103,7 +103,8 @@ fn entry() -> Result<()> {
     if let Action::Worker { input, output } = &cli.command {
         std::env::set_var("GIT_MONITOR_WORKER", "1");
         let task: Task = serde_json::from_slice(&std::fs::read(input)?)?;
-        let result: Analysis = monitor::analyze(&task)?;
+        let mut result: Analysis = monitor::analyze(&task)?;
+        result.counters = git_monitor::metrics::snapshot();
         let bytes = serde_json::to_vec(&result)?;
         anyhow::ensure!(
             bytes.len() <= task.limits.max_job_output_bytes,

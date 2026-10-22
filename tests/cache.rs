@@ -25,3 +25,58 @@ fn operation_counts_merge_without_double_counting_process_resources() {
     metrics::log("test");
     let _: metrics::Counters = serde_json::from_str("{}").unwrap();
 }
+#[test]
+fn render_fragments_rebind_file_anchors_and_preserve_report_bindings() {
+    use git_monitor::{
+        diff,
+        model::{CommitView, EventView, Report},
+        render,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    render::set_cache(Some(temp.path().into()));
+    metrics::reset();
+    let file = diff::build(
+        "test.c",
+        b"int x=1;",
+        b"int x=2;",
+        1,
+        1,
+        None,
+        &Default::default(),
+        &Default::default(),
+    );
+    let mut report = Report {
+        recipient: "alice".into(),
+        generated_at: 1,
+        events: vec![EventView {
+            id: 1,
+            repository: "repo".into(),
+            remote: "origin".into(),
+            branch: "main".into(),
+            kind: "branch_updated".into(),
+            old: None,
+            new: None,
+            observed_at: 1,
+            watches: vec!["first".into()],
+            commits: vec![CommitView {
+                oid: "a".repeat(40),
+                subject: "subject".into(),
+                author: "author".into(),
+                files: vec![file.clone(), file],
+            }],
+            files: vec![],
+            notes: vec![],
+            outgoing: vec![],
+        }],
+    };
+    let first = render::html(&report, &Default::default());
+    report.recipient = "bob".into();
+    report.events[0].watches = vec!["second".into()];
+    let second = render::html(&report, &Default::default());
+    assert!(first.contains("alice"));
+    assert!(second.contains("bob"));
+    assert!(second.contains("second"));
+    assert!(second.contains("id=\"file-2\""));
+    assert!(metrics::snapshot().render_cache_hits >= 2);
+    render::set_cache(None);
+}
