@@ -203,8 +203,12 @@ an earlier context, establish a fresh epoch and baseline. `doctor` performs
 offline capability probes, storage write checks, worker-limit and queue-integrity
 checks without contacting configured remotes or SMTP.
 
-This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file and function patches use Git histogram. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
+This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis have bounded pools. Persistent operation runs fetch, analysis, reporting and SMTP on independent clocks with a dedicated SQLite command worker. Tokio owns process I/O, signals and timers. `new_branch_mode="compare"` requires explicit `defaults.base_remote` and `defaults.base_branch`; the base OID is frozen in the attempt and event. The default `summary` mode emits metadata only. Whole-file and function patches use Git histogram. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
 
 Licensed under [MIT](LICENSE).
 
 Immutable analysis inputs use a checksummed disk cache keyed by the frozen Git/lockfile/analyzer profile. Ref reads and network operations remain live. Blob reads are batched within object/output budgets; function selections and HTML file fragments have separate cache identities. `execution.share_computations=false` disables reuse for comparison with a naive run. `maintenance.cache_items` and `maintenance.cache_bytes` bound disposable caches. Operation counters and cumulative waited-child CPU/max RSS are recorded separately from timing claims.
+
+Current DiffDocument schema 3 contains selected source hashes/profile, byte edits, hunks, line pairs, source spans and syntax correspondences. Rendering reads selected bytes through these ranges; legacy rows remain a compatibility projection. Canonical histogram patches and normalized Myers reconstruction edits are separate representations. Structure annotations preserve all textual changes and carry evidence labels. Reports include native folding, local hunk/move navigation, event and aggregate filters, and repeated-commit ref provenance. Parse caches are disposable and bounded by maintenance.
+
+Planner microbenchmarks cover 1/10/100/1000 repeated and distinct selectors; these do not claim end-to-end Git timings. Integration tests exercise 1000 real identical watch bindings with one computation.

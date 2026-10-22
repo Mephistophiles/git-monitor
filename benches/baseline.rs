@@ -125,5 +125,41 @@ fn end_to_end(c: &mut Criterion) {
     });
     group.finish();
 }
-criterion_group!(benches, baseline, end_to_end);
+fn filter_scaling(c: &mut Criterion) {
+    use std::collections::BTreeSet;
+    let cfg: git_monitor::config::Config =
+        toml::from_str(include_str!("../examples/monitor.toml")).unwrap();
+    let mut group = c.benchmark_group("canonical_filter_grouping");
+    group
+        .sample_size(10)
+        .warm_up_time(std::time::Duration::from_millis(100))
+        .measurement_time(std::time::Duration::from_millis(200));
+    for n in [1, 10, 100, 1000] {
+        for distinct in [false, true] {
+            let watches: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut w = cfg.watches[0].clone();
+                    w.id = format!("consumer_{i}");
+                    if distinct {
+                        w.paths = Some(vec![format!("file_{i}.c")]);
+                        w.function = None;
+                    }
+                    w
+                })
+                .collect();
+            group.bench_function(
+                format!("{}_n_{n}", if distinct { "distinct" } else { "repeated" }),
+                |b| {
+                    b.iter(|| {
+                        let keys: BTreeSet<_> = watches.iter().map(|w| w.selector_key()).collect();
+                        assert_eq!(keys.len(), if distinct { n } else { 1 });
+                        black_box(keys)
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+criterion_group!(benches, baseline, end_to_end, filter_scaling);
 criterion_main!(benches);
