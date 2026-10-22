@@ -41,7 +41,7 @@ const { pathToFileURL } = require('node:url');
   await summary.click();
   assert.equal(await page.locator('.file-body').first().getAttribute('open'),null);
   await summary.click();
-  await page.locator('.hunk-link').first().click();
+  await page.locator('.hunk-link:visible').first().click();
   assert.ok(new URL(page.url()).hash.includes('row-'));
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
