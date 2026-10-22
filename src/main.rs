@@ -168,7 +168,7 @@ fn entry() -> Result<()> {
             monitor::recover(&mut store, &shutdown)?;
             println!(
                 "{} messages sent",
-                monitor::send(&cfg, &store, &mail, &shutdown, true)?
+                monitor::send(&cfg, &mut store, &mail, &shutdown, true)?
             );
         }
         Action::Run {
@@ -180,6 +180,18 @@ fn entry() -> Result<()> {
             monitor::doctor()?;
             for id in cfg.recipients.keys() {
                 store.clock(id)?;
+            }
+            if !once {
+                monitor::daemon(
+                    &cfg,
+                    &mut store,
+                    mail.as_ref(),
+                    &shutdown,
+                    force,
+                    prepare_only,
+                    output_dir.as_deref(),
+                )?;
+                return Ok(());
             }
             let mut first = true;
             loop {
@@ -198,7 +210,7 @@ fn entry() -> Result<()> {
                     0
                 };
                 let sent = if let Some(mail) = mail.as_ref().filter(|_| !prepare_only) {
-                    monitor::send(&cfg, &store, mail, &shutdown, false)?
+                    monitor::send(&cfg, &mut store, mail, &shutdown, false)?
                 } else {
                     0
                 };

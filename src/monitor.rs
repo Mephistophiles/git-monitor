@@ -907,6 +907,17 @@ pub fn report(
 pub fn outputs(
     cfg: &Config,
     store: &mut Store,
+    mail: Option<&MailConfig>,
+    shutdown: &Shutdown,
+    output: Option<&Path>,
+) -> Result<usize> {
+    crate::persistence::scope(store, |actor| {
+        outputs_actor(cfg, actor, mail, shutdown, output)
+    })
+}
+fn outputs_actor(
+    cfg: &Config,
+    actor: &crate::persistence::Actor,
     mail_config: Option<&MailConfig>,
     shutdown: &Shutdown,
     output: Option<&Path>,
@@ -918,39 +929,22 @@ pub fn outputs(
         if shutdown.requested() {
             break;
         }
-        if let Some(mail) = mail_config {
-            let revision = mail::revision(cfg, recipient, mail);
-            let stale: Vec<String> = store.db.prepare("SELECT DISTINCT digest FROM deliveries WHERE recipient=? AND revision<>? AND state NOT IN ('sent','revoked')")?.query_map(params![recipient, revision], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-            for digest in stale {
-                let tx = store.db.transaction()?;
-                tx.execute(
-                    "UPDATE deliveries SET state='revoked' WHERE digest=? AND state<>'sent'",
-                    [&digest],
-                )?;
-                tx.execute("UPDATE matches SET digest=NULL WHERE digest=?", [&digest])?;
-                tx.execute(
-                    "UPDATE clocks SET last_digest=0 WHERE recipient=?",
-                    [recipient],
-                )?;
-                tx.commit()?;
-            }
-        }
-        let (pending, ids) = report(cfg, store, recipient, mail_config.is_some())?;
+        let revision = mail_config.map(|m| mail::revision(cfg, recipient, m));
+        let (configuration, name, wanted) = (cfg.clone(), recipient.clone(), revision.clone());
+        let(pending,ids,preview,clock)=actor.call(move|store|{let has_mail=wanted.is_some();if let Some(revision)=wanted{
+   let stale:Vec<String>=store.db.prepare("SELECT DISTINCT digest FROM deliveries WHERE recipient=? AND revision<>? AND state NOT IN ('sent','revoked')")?.query_map(params![name,revision],|r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
+   for digest in stale{let tx=store.db.transaction()?;tx.execute("UPDATE deliveries SET state='revoked' WHERE digest=? AND state<>'sent'",[&digest])?;tx.execute("UPDATE matches SET digest=NULL WHERE digest=?",[&digest])?;tx.execute("UPDATE clocks SET last_digest=0 WHERE recipient=?",[&name])?;tx.commit()?;}
+  }let(pending,ids)=report(&configuration,store,&name,has_mail)?;let preview=if pending.events.is_empty()&&has_mail{report(&configuration,store,&name,false)?.0}else{pending.clone()};Ok((pending,ids,preview,store.clock(&name)?))})?;
         let interval = duration(
             r.digest_every
                 .as_deref()
                 .unwrap_or(&cfg.defaults.digest_every),
         )?
         .as_secs();
-        let ready = mail_config.is_some()
+        let ready = revision.is_some()
             && !pending.events.is_empty()
-            && crate::now().saturating_sub(store.clock(recipient)?) >= interval
+            && crate::now().saturating_sub(clock) >= interval
             && !shutdown.requested();
-        let preview = if pending.events.is_empty() && mail_config.is_some() {
-            report(cfg, store, recipient, false)?.0
-        } else {
-            pending.clone()
-        };
         let prepared = match crate::prepare::bounded(
             cfg,
             &preview,
@@ -958,116 +952,201 @@ pub fn outputs(
             mail_config.map(|m| m.smtp.from.as_str()),
             shutdown,
         ) {
-            Ok(prepared) => prepared,
+            Ok(result) => result,
             Err(_) if shutdown.requested() => break,
             Err(error) => return Err(error),
         };
+        actor.record_metrics("report-worker", &prepared.counters)?;
         crate::atomic_write(
             &artifacts.join(format!("{recipient}-latest.html")),
             prepared.html.as_bytes(),
         )?;
-        if let Some(dir) = output {
+        if let Some(output) = output {
             crate::atomic_write(
-                &dir.join(format!("{recipient}.html")),
+                &output.join(format!("{recipient}.html")),
                 prepared.html.as_bytes(),
             )?;
         }
         if !ready {
             continue;
         }
-        let revision = mail::revision(cfg, recipient, mail_config.unwrap());
-        let parts = prepared.parts;
-        let tx = store.db.transaction()?;
+        let revision = revision.unwrap();
         let digest = crate::hash(serde_json::to_vec(&(
             &revision,
             &ids,
             pending.generated_at,
         ))?);
-        tx.execute(
-            "INSERT OR IGNORE INTO delivery_times VALUES(?,?)",
-            params![digest, crate::now()],
-        )?;
-        for (index, (id, mime, html)) in parts.into_iter().enumerate() {
-            let artifact = artifacts.join(format!("{digest}-{}.html", index + 1));
-            crate::atomic_write(&artifact, html.as_bytes())?;
-            tx.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,digest=excluded.digest,mime=excluded.mime,state='pending' WHERE deliveries.state='revoked'",params![id,recipient,revision,digest,mime])?;
-            queued += 1;
-        }
-        for id in ids {
-            tx.execute(
-                "UPDATE matches SET digest=? WHERE id=?",
-                params![digest, id],
+        let mut messages = vec![];
+        for (index, (id, mime, html)) in prepared.parts.into_iter().enumerate() {
+            crate::atomic_write(
+                &artifacts.join(format!("{digest}-{}.html", index + 1)),
+                html.as_bytes(),
             )?;
+            messages.push((id, mime));
         }
-        tx.execute(
-            "UPDATE clocks SET last_digest=? WHERE recipient=?",
-            params![crate::now(), recipient],
-        )?;
-        tx.commit()?;
+        queued += messages.len();
+        let recipient = recipient.clone();
+        actor.call(move|store|{let tx=store.db.transaction()?;tx.execute("INSERT OR IGNORE INTO delivery_times VALUES(?,?)",params![digest,crate::now()])?;for(id,mime)in messages{tx.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,digest=excluded.digest,mime=excluded.mime,state='pending' WHERE deliveries.state='revoked'",params![id,recipient,revision,digest,mime])?;}for id in ids{tx.execute("UPDATE matches SET digest=? WHERE id=?",params![digest,id])?;}tx.execute("UPDATE clocks SET last_digest=? WHERE recipient=?",params![crate::now(),recipient])?;tx.commit()?;Ok(())})?;
     }
     Ok(queued)
 }
-
 pub fn send(
     cfg: &Config,
-    store: &Store,
+    store: &mut Store,
     mail: &MailConfig,
     shutdown: &Shutdown,
     force: bool,
 ) -> Result<usize> {
-    let rows: Vec<(String,String,String)> = store.db.prepare("SELECT id,recipient,revision FROM deliveries WHERE state IN ('pending','uncertain') AND (? OR next_attempt<=?) ORDER BY rowid LIMIT 100")?.query_map(params![force,crate::now()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<_,_>>()?;
+    crate::persistence::scope(store, |actor| send_actor(cfg, actor, mail, shutdown, force))
+}
+fn send_actor(
+    cfg: &Config,
+    actor: &crate::persistence::Actor,
+    mail: &MailConfig,
+    shutdown: &Shutdown,
+    force: bool,
+) -> Result<usize> {
+    let rows:Vec<(String,String,String)>=actor.call(move|store|Ok(store.db.prepare("SELECT id,recipient,revision FROM deliveries WHERE state IN ('pending','uncertain') AND (? OR next_attempt<=?) ORDER BY rowid LIMIT 100")?.query_map(params![force,crate::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<_,_>>()?))?;
     let mut sent = 0;
     for (id, recipient, revision) in rows {
         if shutdown.requested() {
             break;
         }
         let Some(r) = cfg.recipients.get(&recipient) else {
-            store
-                .db
-                .execute("UPDATE deliveries SET state='revoked' WHERE id=?", [&id])?;
+            actor.call(move |store| {
+                store
+                    .db
+                    .execute("UPDATE deliveries SET state='revoked' WHERE id=?", [id])?;
+                Ok(())
+            })?;
             continue;
         };
         if mail::revision(cfg, &recipient, mail) != revision {
             continue;
         }
-        let mime: Vec<u8> =
-            store
+        let key = id.clone();
+        let mime: Vec<u8> = actor.call(move |store| {
+            Ok(store
                 .db
-                .query_row("SELECT mime FROM deliveries WHERE id=?", [&id], |r| {
+                .query_row("SELECT mime FROM deliveries WHERE id=?", [key], |r| {
                     r.get(0)
-                })?;
+                })?)
+        })?;
         let message = cfg.storage.state_dir.join("tmp/smtp-message.eml");
         crate::atomic_write(&message, &mime)?;
-        store.db.execute(
-            "UPDATE deliveries SET state='sending',attempts=attempts+1 WHERE id=?",
-            [&id],
-        )?;
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("smtp-worker")
+        let key = id.clone();
+        actor.call(move |store| {
+            store.db.execute(
+                "UPDATE deliveries SET state='sending',attempts=attempts+1 WHERE id=?",
+                [key],
+            )?;
+            Ok(())
+        })?;
+        let mut command = Command::new(process::worker_executable()?);
+        command
+            .arg("smtp-worker")
             .arg("--message")
             .arg(&message)
             .env("GIT_MONITOR_SMTP", serde_json::to_string(&mail.smtp)?)
             .env("GIT_MONITOR_TO", serde_json::to_string(&r.to)?);
-        let result = process::run(
-            &mut cmd,
+        let success = process::run(
+            &mut command,
             duration(&mail.smtp.timeout)? + Duration::from_secs(2),
             65536,
             shutdown,
             duration(&cfg.execution.shutdown_grace)?,
             None,
-        );
-        if result.is_ok_and(|o| o.code == 0) {
-            store.db.execute(
-                "UPDATE deliveries SET state='sent',error=NULL WHERE id=?",
-                [&id],
-            )?;
+        )
+        .is_ok_and(|o| o.code == 0);
+        actor.call(move|store|{if success{store.db.execute("UPDATE deliveries SET state='sent',error=NULL WHERE id=?",[id])?;}else{store.db.execute("UPDATE deliveries SET state='uncertain',error='SMTP attempt incomplete; duplicate possible',next_attempt=? + min(3600,5 * (1 << min(attempts-1,9))) WHERE id=?",params![crate::now(),id])?;}Ok(())})?;
+        if success {
             sent += 1;
-        } else {
-            store.db.execute("UPDATE deliveries SET state='uncertain',error='SMTP attempt incomplete; duplicate possible',next_attempt=? + min(3600,5 * (1 << min(attempts-1,9))) WHERE id=?",params![crate::now(),id])?;
         }
-        let _ = std::fs::remove_file(&message);
+        let _ = std::fs::remove_file(message);
     }
     Ok(sent)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn daemon(
+    cfg: &Config,
+    store: &mut Store,
+    mail: Option<&MailConfig>,
+    shutdown: &Shutdown,
+    force: bool,
+    prepare_only: bool,
+    output: Option<&Path>,
+) -> Result<()> {
+    struct Guard<'a>(&'a Shutdown);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            if !self.0.requested() {
+                self.0.request();
+            }
+        }
+    }
+    recover(store, shutdown)?;
+    crate::persistence::scope(store, |actor| {
+        std::thread::scope(|threads| {
+            let mut phases = vec![];
+            for role in ["fetch", "analysis", "report", "smtp"] {
+                phases.push(threads.spawn(move || -> Result<()> {
+                    let _guard = Guard(shutdown);
+                    let mut first = true;
+                    while !shutdown.requested() {
+                        crate::metrics::reset();
+                        let result = match role {
+                            "fetch" => {
+                                collect_actor(cfg, actor, shutdown, force && first).map(|_| ())
+                            }
+                            "analysis" => process_jobs_actor(cfg, actor, shutdown).map(|_| ()),
+                            "report" => {
+                                outputs_actor(cfg, actor, mail, shutdown, output).map(|_| ())
+                            }
+                            _ => {
+                                if let Some(mail) = mail.filter(|_| !prepare_only) {
+                                    send_actor(cfg, actor, mail, shutdown, false).map(|_| ())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
+                        if let Err(error) = result {
+                            shutdown.request();
+                            return Err(error.context(format!("{role} phase")));
+                        }
+                        actor.record_metrics(role, &crate::metrics::snapshot())?;
+                        crate::metrics::log(role);
+                        first = false;
+                        process::pause(
+                            if role == "analysis" || role == "smtp" {
+                                Duration::from_millis(100)
+                            } else {
+                                Duration::from_secs(1)
+                            },
+                            shutdown,
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            let mut failure = None;
+            for phase in phases {
+                match phase.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failure = Some(e),
+                    Err(_) => {
+                        shutdown.request();
+                        failure = Some(anyhow::anyhow!("phase panicked"));
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })
+    })
 }
 
 pub fn doctor() -> Result<String> {
