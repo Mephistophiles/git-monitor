@@ -63,7 +63,11 @@ fn render_fragments_rebind_file_anchors_and_preserve_report_bindings() {
                 oid: "a".repeat(40),
                 subject: "subject".into(),
                 author: "author".into(),
-                files: vec![file.clone(), file],
+                files: vec![file.clone(), {
+                    let mut second = file;
+                    second.note = "second fragment".into();
+                    second
+                }],
             }],
             files: vec![],
             notes: vec![],
