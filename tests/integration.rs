@@ -131,6 +131,7 @@ impl Fixture {
             published: git.refs("origin").unwrap(),
             initialized: true,
             plan: FetchPlan::for_watches(&cfg.watches),
+            comparison_base: None,
             watches: cfg.watches,
             previous,
             execution: cfg.execution,
@@ -784,6 +785,7 @@ fn recovery_precedes_refetch_after_remote_rollback() {
         limits: cfg.limits.clone(),
         diff: cfg.diff.clone(),
         plan: FetchPlan::All,
+        comparison_base: None,
     };
     let id = store.begin(&attempt).unwrap();
     // A pending attempt saved by schema 1 has no fetch-plan field.
@@ -1878,6 +1880,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
         old: None,
         new: None,
         observed_at: 0,
+        comparison_base: None,
         watches: vec!["runtime".into()],
         commits: vec![],
         outgoing: vec![],

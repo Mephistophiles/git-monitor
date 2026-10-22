@@ -57,6 +57,7 @@ fn render_fragments_rebind_file_anchors_and_preserve_report_bindings() {
             old: None,
             new: None,
             observed_at: 1,
+            comparison_base: None,
             watches: vec!["first".into()],
             commits: vec![CommitView {
                 oid: "a".repeat(40),

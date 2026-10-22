@@ -307,7 +307,21 @@ pub fn analyze(task: &Task) -> Result<Analysis> {
         shutdown: Shutdown::default(),
     };
     let mut result = Analysis::default();
-    if task.event.kind == "branch_created" || task.event.kind == "branch_deleted" {
+    if task.event.kind == "branch_created" {
+        if let Some(base) = &task.event.comparison_base {
+            let new = task.event.new.as_deref().context("missing new OID")?;
+            let changes = git.changed(Some(&base.oid), new)?;
+            let (files, notes) = selected(&git, task, Some(&base.oid), new, &changes, false)?;
+            result.files = files;
+            result.notes = notes;
+            result.notes.push(format!(
+                "Comparison against explicit base {}/{} @ {}; branch origin is not inferred",
+                base.remote, base.branch, base.oid
+            ));
+        }
+        return Ok(result);
+    }
+    if task.event.kind == "branch_deleted" {
         return Ok(result);
     }
     let old = task.event.old.as_deref().context("missing old OID")?;
@@ -330,13 +344,18 @@ pub fn analyze(task: &Task) -> Result<Analysis> {
     }
     if task.event.kind == "history_rewritten" {
         result.outgoing = git.commits(new, old)?;
+    }
+    {
         let changes = git.changed(Some(old), new)?;
         let (files, notes) = selected(&git, task, Some(old), new, &changes, false)?;
         result.files = files;
         result.notes.extend(notes);
-        result.notes.push(
-            "History rewritten: aggregate old → new comparison; commit history is a DAG.".into(),
-        );
+        if task.event.kind == "history_rewritten" {
+            result.notes.push(
+                "History rewritten: aggregate old → new comparison; commit history is a DAG."
+                    .into(),
+            );
+        }
     }
     Ok(result)
 }
@@ -470,6 +489,30 @@ fn collect_actor(
                 shutdown: shutdown.clone(),
             };
             git.init_format(&r.object_format)?;
+            let comparison_base = if cfg.defaults.new_branch_mode == "compare" {
+                let remote = cfg
+                    .defaults
+                    .base_remote
+                    .as_deref()
+                    .context("missing base_remote")?;
+                let branch = cfg
+                    .defaults
+                    .base_branch
+                    .as_deref()
+                    .context("missing base_branch")?;
+                let source = &r.remotes[remote];
+                let Some(_permit) = hosts.acquire(&source.url, shutdown) else {
+                    return Ok((0, 0));
+                };
+                git.configure_remote(remote, &source.url)?;
+                Some(crate::model::ComparisonBase {
+                    remote: remote.into(),
+                    branch: branch.into(),
+                    oid: git.fetch_base(remote, branch)?,
+                })
+            } else {
+                None
+            };
             for (remote, source) in &r.remotes {
                 if shutdown.requested() {
                     break;
@@ -527,6 +570,7 @@ fn collect_actor(
                     limits: cfg.limits.clone(),
                     diff: cfg.diff.clone(),
                     plan,
+                    comparison_base: comparison_base.clone(),
                 };
                 for oid in attempt.old.values() {
                     git.pin(oid)?;
@@ -589,6 +633,7 @@ pub fn analysis_key(cfg: &Config, task: &Task) -> Result<String> {
         &task.event.old,
         &task.event.new,
         &task.event.kind,
+        &task.event.comparison_base,
         task.watch.selector_key(),
         task.previous_watch.as_ref().map(Watch::selector_key),
         &task.diff,

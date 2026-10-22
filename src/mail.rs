@@ -145,6 +145,7 @@ fn skeleton(e: &EventView) -> EventView {
         old: e.old.clone(),
         new: e.new.clone(),
         observed_at: e.observed_at,
+        comparison_base: e.comparison_base.clone(),
         watches: e.watches.clone(),
         commits: vec![],
         files: vec![],

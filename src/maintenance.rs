@@ -85,10 +85,11 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
         .collect::<std::result::Result<_, _>>()?;
     for body in jobs {
         let task: Task = serde_json::from_str(&body)?;
+        let base = task.event.comparison_base.map(|b| b.oid);
         roots
             .entry(task.path)
             .or_default()
-            .extend(task.event.old.into_iter().chain(task.event.new));
+            .extend(task.event.old.into_iter().chain(task.event.new).chain(base));
     }
     // Snapshots may be needed when an old source is re-enabled. They are tiny;
     // keep their tips while the corresponding snapshot is retained.

@@ -8,6 +8,13 @@ pub struct Report {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonBase {
+    pub remote: String,
+    pub branch: String,
+    pub oid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventView {
     pub id: i64,
     pub repository: String,
@@ -17,6 +24,8 @@ pub struct EventView {
     pub old: Option<String>,
     pub new: Option<String>,
     pub observed_at: u64,
+    #[serde(default)]
+    pub comparison_base: Option<ComparisonBase>,
     pub watches: Vec<String>,
     pub commits: Vec<CommitView>,
     pub outgoing: Vec<String>,

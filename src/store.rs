@@ -28,6 +28,8 @@ pub struct Attempt {
     pub diff: DiffConfig,
     #[serde(default)]
     pub plan: FetchPlan,
+    #[serde(default)]
+    pub comparison_base: Option<crate::model::ComparisonBase>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -311,6 +313,11 @@ impl Store {
                     old,
                     new: next,
                     observed_at: crate::now(),
+                    comparison_base: if kind == "branch_created" {
+                        a.comparison_base.clone()
+                    } else {
+                        None
+                    },
                     watches: vec![],
                     commits: vec![],
                     outgoing: vec![],

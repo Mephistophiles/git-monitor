@@ -23,6 +23,7 @@ fn event() -> EventView {
         old: None,
         new: None,
         observed_at: 0,
+        comparison_base: None,
         watches: vec!["scope".into()],
         commits: vec![],
         outgoing: vec![],

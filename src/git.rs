@@ -697,16 +697,53 @@ impl Git {
             .into())
     }
     pub fn tree_blob(&self, rev: &str, path: &str) -> Result<Option<String>> {
-        let spec = format!("{rev}:{path}");
-        let out = process::run(
-            self.command().args(["rev-parse", "--verify", &spec]),
-            duration(&self.execution.git_timeout)?,
-            65536,
-            &self.shutdown,
-            duration(&self.execution.shutdown_grace)?,
+        let records = self.raw(&["ls-tree", "-z", rev, "--", path])?;
+        for record in records.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let tab = record
+                .iter()
+                .position(|b| *b == b'\t')
+                .context("invalid tree entry")?;
+            if &record[tab + 1..] != path.as_bytes() {
+                continue;
+            }
+            let fields: Vec<_> = std::str::from_utf8(&record[..tab])?
+                .split_whitespace()
+                .collect();
+            ensure!(
+                fields.len() == 3 && fields[1] == "blob",
+                "function path is not a blob"
+            );
+            return Ok(Some(fields[2].into()));
+        }
+        Ok(None)
+    }
+    pub fn fetch_base(&self, remote: &str, branch: &str) -> Result<String> {
+        let reference = format!("refs/heads/{branch}");
+        self.raw(&["check-ref-format", &reference])?;
+        let target = format!(
+            "refs/git-monitor/bases/{}",
+            crate::hash(format!("{remote}:{branch}"))
+        );
+        self.network(
+            &[
+                "fetch",
+                "--atomic",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--refmap=",
+                remote,
+                &format!("+{reference}:{target}"),
+            ],
             None,
+            remote,
+            false,
         )?;
-        Ok((out.code == 0).then(|| String::from_utf8_lossy(&out.stdout).trim().into()))
+        let oid = self
+            .ref_oid(&target)?
+            .context("comparison base unavailable")?;
+        self.pin(&oid)?;
+        Ok(oid)
     }
     pub fn select(&self, rev: Option<&str>, f: &Function) -> Result<Option<Selection>> {
         let Some(rev) = rev else {

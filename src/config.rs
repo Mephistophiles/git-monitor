@@ -92,6 +92,8 @@ pub struct Defaults {
     pub poll_every: String,
     pub digest_every: String,
     pub new_branch_mode: String,
+    pub base_remote: Option<String>,
+    pub base_branch: Option<String>,
     pub max_message_bytes: usize,
 }
 impl Default for Defaults {
@@ -100,6 +102,8 @@ impl Default for Defaults {
             poll_every: "5m".into(),
             digest_every: "1h".into(),
             new_branch_mode: "summary".into(),
+            base_remote: None,
+            base_branch: None,
             max_message_bytes: 15_000_000,
         }
     }
@@ -313,9 +317,35 @@ impl Config {
         }
         ensure!(self.version == 1, "unsupported configuration version");
         ensure!(
-            self.defaults.new_branch_mode == "summary",
-            "v0.1 supports new_branch_mode=summary"
+            ["summary", "compare"].contains(&self.defaults.new_branch_mode.as_str()),
+            "new_branch_mode must be summary or compare"
         );
+        if self.defaults.new_branch_mode == "compare" {
+            let remote = self
+                .defaults
+                .base_remote
+                .as_deref()
+                .context("compare needs base_remote")?;
+            let branch = self
+                .defaults
+                .base_branch
+                .as_deref()
+                .context("compare needs base_branch")?;
+            ensure!(
+                valid_id(remote)
+                    && !branch.is_empty()
+                    && !branch
+                        .bytes()
+                        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace()),
+                "invalid comparison base"
+            );
+            for r in self.repositories.values() {
+                ensure!(
+                    r.remotes.contains_key(remote),
+                    "base_remote missing from repository"
+                );
+            }
+        }
         ensure!(
             self.defaults.max_message_bytes >= 32768,
             "max_message_bytes must be at least 32768"
