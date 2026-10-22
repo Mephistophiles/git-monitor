@@ -23,6 +23,29 @@ pub struct Config {
     pub repositories: BTreeMap<String, Repository>,
     #[serde(default)]
     pub watches: Vec<Watch>,
+    #[serde(default)]
+    pub maintenance: Maintenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Maintenance {
+    pub cache_bytes: u64,
+    pub cache_items: usize,
+    pub history_days: u64,
+    pub artifact_days: u64,
+    pub temporary_hours: u64,
+}
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            cache_bytes: 1_000_000_000,
+            cache_items: 10000,
+            history_days: 90,
+            artifact_days: 30,
+            temporary_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,22 +57,31 @@ pub struct Storage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Execution {
+    pub share_computations: bool,
     pub max_fetches: usize,
     pub max_fetches_per_host: usize,
     pub max_analyses: usize,
     pub git_timeout: String,
     pub bootstrap_timeout: String,
     pub shutdown_grace: String,
+    /// Explicitly permitted textual Git function-boundary rules.
+    #[serde(default)]
+    pub diff_drivers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub analysis_profile: crate::profile::AnalysisProfile,
 }
 impl Default for Execution {
     fn default() -> Self {
         Self {
+            share_computations: true,
             max_fetches: 4,
             max_fetches_per_host: 2,
             max_analyses: 4,
             git_timeout: "3m".into(),
             bootstrap_timeout: "30m".into(),
             shutdown_grace: "60s".into(),
+            diff_drivers: BTreeMap::new(),
+            analysis_profile: Default::default(),
         }
     }
 }
@@ -60,6 +92,8 @@ pub struct Defaults {
     pub poll_every: String,
     pub digest_every: String,
     pub new_branch_mode: String,
+    pub base_remote: Option<String>,
+    pub base_branch: Option<String>,
     pub max_message_bytes: usize,
 }
 impl Default for Defaults {
@@ -68,6 +102,8 @@ impl Default for Defaults {
             poll_every: "5m".into(),
             digest_every: "1h".into(),
             new_branch_mode: "summary".into(),
+            base_remote: None,
+            base_branch: None,
             max_message_bytes: 15_000_000,
         }
     }
@@ -101,6 +137,8 @@ impl Default for DiffConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
+    pub render_timeout: String,
+    pub max_render_output_bytes: usize,
     pub max_blob_bytes: usize,
     pub max_patch_bytes: usize,
     pub max_job_output_bytes: usize,
@@ -115,6 +153,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            render_timeout: "30s".into(),
+            max_render_output_bytes: 256_000_000,
             max_blob_bytes: 32_000_000,
             max_patch_bytes: 64_000_000,
             max_job_output_bytes: 128_000_000,
@@ -136,12 +176,20 @@ pub struct Recipient {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Repository {
+    #[serde(default = "default_object_format")]
+    pub object_format: String,
     pub remotes: BTreeMap<String, Remote>,
+}
+fn default_object_format() -> String {
+    "sha1".into()
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Remote {
     pub url: String,
     pub poll_every: Option<String>,
+    /// Nonsecret identity of the credentials/visibility context. Rotate when access changes.
+    #[serde(default)]
+    pub access_context: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Watch {
@@ -228,10 +276,16 @@ impl Watch {
             p.dedup();
         }
         w.exclude_paths.sort();
+        w.exclude_paths.dedup();
         crate::hash(serde_json::to_vec(&w).expect("watch serialization"))
     }
 }
 impl Config {
+    pub fn freeze(&mut self) -> Result<()> {
+        self.execution.analysis_profile =
+            crate::profile::AnalysisProfile::freeze(&self.execution.diff_drivers)?;
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -249,11 +303,49 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.execution.max_fetches > 0
+                && self.execution.max_fetches_per_host > 0
+                && self.execution.max_analyses > 0,
+            "concurrency limits must be positive"
+        );
+        for (name, expression) in &self.execution.diff_drivers {
+            ensure!(
+                valid_id(name) && !expression.is_empty() && !expression.contains('\0'),
+                "invalid allowed diff driver"
+            );
+        }
         ensure!(self.version == 1, "unsupported configuration version");
         ensure!(
-            self.defaults.new_branch_mode == "summary",
-            "v0.1 supports new_branch_mode=summary"
+            ["summary", "compare"].contains(&self.defaults.new_branch_mode.as_str()),
+            "new_branch_mode must be summary or compare"
         );
+        if self.defaults.new_branch_mode == "compare" {
+            let remote = self
+                .defaults
+                .base_remote
+                .as_deref()
+                .context("compare needs base_remote")?;
+            let branch = self
+                .defaults
+                .base_branch
+                .as_deref()
+                .context("compare needs base_branch")?;
+            ensure!(
+                valid_id(remote)
+                    && !branch.is_empty()
+                    && !branch
+                        .bytes()
+                        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace()),
+                "invalid comparison base"
+            );
+            for r in self.repositories.values() {
+                ensure!(
+                    r.remotes.contains_key(remote),
+                    "base_remote missing from repository"
+                );
+            }
+        }
         ensure!(
             self.defaults.max_message_bytes >= 32768,
             "max_message_bytes must be at least 32768"
@@ -287,6 +379,7 @@ impl Config {
             &self.defaults.digest_every,
             &self.limits.analysis_timeout,
             &self.limits.syntax_timeout,
+            &self.limits.render_timeout,
         ] {
             duration(s)?;
         }
@@ -296,6 +389,7 @@ impl Config {
         );
         ensure!(
             self.limits.max_blob_bytes > 0
+                && self.limits.max_render_output_bytes > 0
                 && self.limits.max_patch_bytes > 0
                 && self.limits.max_job_output_bytes > 0
                 && self.limits.max_part_count > 0,
@@ -303,6 +397,10 @@ impl Config {
         );
         for (id, r) in &self.repositories {
             ensure!(valid_id(id), "invalid repository ID");
+            ensure!(
+                ["sha1", "sha256"].contains(&r.object_format.as_str()),
+                "unsupported repository object format"
+            );
             for (id, r) in &r.remotes {
                 ensure!(valid_id(id), "invalid remote ID");
                 ensure!(

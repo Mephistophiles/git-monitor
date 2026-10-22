@@ -42,7 +42,7 @@ fn baseline(c: &mut Criterion) {
     });
 }
 
-fn incremental_fixture(branches: &str) -> tempfile::TempDir {
+fn incremental_fixture(branches: &str, consumers: usize) -> tempfile::TempDir {
     use std::process::{Command, Stdio};
     let root = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
@@ -65,6 +65,14 @@ fn incremental_fixture(branches: &str) -> tempfile::TempDir {
     git(&["add", "."]);
     git(&["commit", "-qm", "Initial"]);
     let cfg = format!("version=1\n[storage]\nrepositories_dir='cache'\nstate_dir='state'\n[defaults]\ndigest_every='0s'\n[recipients.bench]\nto=['bench@example.invalid']\n[repositories.bench.remotes.origin]\nurl='{}'\n[[watches]]\nid='bench'\nrepository='bench'\nremotes=['origin']\nrecipients=['bench']\nbranches={branches}\npaths=['*.c']\n", root.path().display());
+    let template = cfg.split("[[watches]]").nth(1).unwrap().to_owned();
+    let mut cfg = cfg;
+    for i in 1..consumers {
+        cfg.push_str(&format!(
+            "\n[[watches]]{}",
+            template.replace("id='bench'", &format!("id='bench_{i}'"))
+        ));
+    }
     std::fs::write(root.path().join("monitor.toml"), cfg).unwrap();
     std::fs::write(root.path().join("mail.toml"), "version=1\n[smtp]\nhost='localhost'\nport=2525\nsecurity='none'\nfrom='bench@example.invalid'\ntimeout='1s'\n").unwrap();
     run_pass(root.path());
@@ -105,7 +113,7 @@ fn end_to_end(c: &mut Criterion) {
         .measurement_time(std::time::Duration::from_secs(2));
     group.bench_function("incremental_fetch_to_mime", |b| {
         b.iter_batched(
-            || incremental_fixture("{all=true}"),
+            || incremental_fixture("{all=true}", 1),
             |root| {
                 run_pass(root.path());
                 black_box(root)
@@ -115,7 +123,7 @@ fn end_to_end(c: &mut Criterion) {
     });
     group.bench_function("incremental_selected_fetch_to_mime", |b| {
         b.iter_batched(
-            || incremental_fixture("{include=['main']}"),
+            || incremental_fixture("{include=['main']}", 1),
             |root| {
                 run_pass(root.path());
                 black_box(root)
@@ -125,5 +133,79 @@ fn end_to_end(c: &mut Criterion) {
     });
     group.finish();
 }
-criterion_group!(benches, baseline, end_to_end);
+fn filter_scaling(c: &mut Criterion) {
+    use std::collections::BTreeSet;
+    let cfg: git_monitor::config::Config =
+        toml::from_str(include_str!("../examples/monitor.toml")).unwrap();
+    let mut group = c.benchmark_group("canonical_filter_grouping");
+    group
+        .sample_size(10)
+        .warm_up_time(std::time::Duration::from_millis(100))
+        .measurement_time(std::time::Duration::from_millis(200));
+    for n in [1, 10, 100, 1000] {
+        for distinct in [false, true] {
+            let watches: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut w = cfg.watches[0].clone();
+                    w.id = format!("consumer_{i}");
+                    if distinct {
+                        w.paths = Some(vec![format!("file_{i}.c")]);
+                        w.function = None;
+                    }
+                    w
+                })
+                .collect();
+            group.bench_function(
+                format!("{}_n_{n}", if distinct { "distinct" } else { "repeated" }),
+                |b| {
+                    b.iter(|| {
+                        let keys: BTreeSet<_> = watches.iter().map(|w| w.selector_key()).collect();
+                        assert_eq!(keys.len(), if distinct { n } else { 1 });
+                        black_box(keys)
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+fn repeated_end_to_end(c: &mut Criterion) {
+    let mut group = c.benchmark_group("end_to_end_repeated_filters");
+    group
+        .sample_size(10)
+        .warm_up_time(std::time::Duration::from_millis(100))
+        .measurement_time(std::time::Duration::from_secs(1));
+    group.bench_function("10_watch_bindings_one_analysis", |b| {
+        b.iter_batched(
+            || incremental_fixture("{all=true}", 10),
+            |root| {
+                run_pass(root.path());
+                let db =
+                    rusqlite::Connection::open(root.path().join("state/state.sqlite3")).unwrap();
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM computations", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM watch_jobs", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    10
+                );
+                black_box(root)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+criterion_group!(
+    benches,
+    baseline,
+    end_to_end,
+    filter_scaling,
+    repeated_end_to_end
+);
 criterion_main!(benches);

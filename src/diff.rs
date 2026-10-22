@@ -1,6 +1,6 @@
 use crate::{
-    config::{duration, DiffConfig, Limits},
-    model::{FileDiff, Row, Span, SyntaxSummary},
+    config::{DiffConfig, Limits},
+    model::{FileDiff, Row, Span},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use similar::{ChangeTag, TextDiff};
@@ -17,27 +17,91 @@ fn span(text: &str, changed: bool) -> Vec<Span> {
     }]
 }
 fn inline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
-    let diff = TextDiff::configure()
-        .timeout(std::time::Duration::from_millis(100))
-        .diff_chars(old, new);
-    let (mut left, mut right) = (vec![], vec![]);
-    for c in diff.iter_all_changes() {
-        if c.tag() != ChangeTag::Insert {
-            left.push(Span {
-                text: c.value().to_owned(),
-                changed: c.tag() != ChangeTag::Equal,
-                syntax: String::new(),
-            });
+    use unicode_segmentation::UnicodeSegmentation;
+    let a: Vec<_> = old.graphemes(true).collect();
+    let b: Vec<_> = new.graphemes(true).collect();
+    let mut left = vec![];
+    let mut right = vec![];
+    for op in similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &a,
+        &b,
+        Some(Instant::now() + std::time::Duration::from_millis(100)),
+    ) {
+        let (tag, x, y) = op.as_tag_tuple();
+        if !x.is_empty() {
+            left.extend(span(&a[x].concat(), tag != similar::DiffTag::Equal));
         }
-        if c.tag() != ChangeTag::Delete {
-            right.push(Span {
-                text: c.value().to_owned(),
-                changed: c.tag() != ChangeTag::Equal,
-                syntax: String::new(),
-            });
+        if !y.is_empty() {
+            right.extend(span(&b[y].concat(), tag != similar::DiffTag::Equal));
         }
     }
     (left, right)
+}
+
+fn pairing(left: &[Row], right: &[Row], limit: usize) -> Vec<(Option<usize>, Option<usize>)> {
+    let n = left.len();
+    let m = right.len();
+    if n.saturating_mul(m) > limit {
+        return (0..n)
+            .map(|i| (Some(i), None))
+            .chain((0..m).map(|i| (None, Some(i))))
+            .collect();
+    }
+    let tokens = |r: &Row, old: bool| {
+        let text: String = (if old { &r.left } else { &r.right })
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        text.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect::<BTreeSet<_>>()
+    };
+    let a: Vec<_> = left.iter().map(|r| tokens(r, true)).collect();
+    let b: Vec<_> = right.iter().map(|r| tokens(r, false)).collect();
+    let score = |i: usize, j: usize| {
+        let total = a[i].len() + b[j].len();
+        if total == 0 {
+            1.0
+        } else {
+            2.0 * a[i].intersection(&b[j]).count() as f32 / total as f32
+        }
+    };
+    let mut dp = vec![0f32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let matched = score(i, j) - 0.3;
+            dp[i * (m + 1) + j] =
+                dp[(i + 1) * (m + 1) + j]
+                    .max(dp[i * (m + 1) + j + 1])
+                    .max(if matched > 0.0 {
+                        dp[(i + 1) * (m + 1) + j + 1] + matched
+                    } else {
+                        0.0
+                    });
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut result = vec![];
+    while i < n || j < m {
+        if i < n
+            && j < m
+            && score(i, j) > 0.3
+            && dp[i * (m + 1) + j] <= dp[(i + 1) * (m + 1) + j + 1] + score(i, j) - 0.3 + 0.00001
+        {
+            result.push((Some(i), Some(j)));
+            i += 1;
+            j += 1;
+        } else if i < n && (j == m || dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) {
+            result.push((Some(i), None));
+            i += 1;
+        } else {
+            result.push((None, Some(j)));
+            j += 1;
+        }
+    }
+    result
 }
 
 pub fn text_rows(
@@ -48,9 +112,43 @@ pub fn text_rows(
     config: &DiffConfig,
     limits: &Limits,
 ) -> Vec<Row> {
+    byte_rows(
+        old.as_bytes(),
+        new.as_bytes(),
+        old_start,
+        new_start,
+        config,
+        limits,
+    )
+}
+fn byte_rows(
+    old: &[u8],
+    new: &[u8],
+    old_start: usize,
+    new_start: usize,
+    config: &DiffConfig,
+    limits: &Limits,
+) -> Vec<Row> {
+    let ranges = |bytes: &[u8]| {
+        let mut result = vec![];
+        let mut start = 0;
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                result.push(start..i + 1);
+                start = i + 1;
+            }
+        }
+        if start < bytes.len() {
+            result.push(start..bytes.len());
+        }
+        result
+    };
+    let (ar, br) = (ranges(old), ranges(new));
+    let aa: Vec<&[u8]> = ar.iter().map(|r| &old[r.clone()]).collect();
+    let bb: Vec<&[u8]> = br.iter().map(|r| &new[r.clone()]).collect();
     let diff = TextDiff::configure()
         .timeout(std::time::Duration::from_secs(2))
-        .diff_lines(old, new);
+        .diff_slices(&aa, &bb);
     let mut rows = vec![];
     for group in diff.grouped_ops(config.context_lines) {
         rows.push(Row {
@@ -63,7 +161,8 @@ pub fn text_rows(
         });
         for op in group {
             for c in diff.iter_changes(&op) {
-                let value = c.value().trim_end_matches('\n');
+                let value =
+                    String::from_utf8_lossy(c.value().strip_suffix(b"\n").unwrap_or(c.value()));
                 rows.push(Row {
                     kind: match c.tag() {
                         ChangeTag::Equal => "context",
@@ -74,12 +173,12 @@ pub fn text_rows(
                     old: c.old_index().map(|i| i + old_start),
                     new: c.new_index().map(|i| i + new_start),
                     left: if c.tag() != ChangeTag::Insert {
-                        span(value, false)
+                        span(&value, false)
                     } else {
                         vec![]
                     },
                     right: if c.tag() != ChangeTag::Delete {
-                        span(value, false)
+                        span(&value, false)
                     } else {
                         vec![]
                     },
@@ -99,7 +198,8 @@ pub fn patch_rows(patch: &[u8], config: &DiffConfig, limits: &Limits) -> Vec<Row
         if line.starts_with("@@ ") {
             let fields: Vec<_> = line.split_whitespace().collect();
             let number = |s: &str| {
-                s[1..]
+                s.get(1..)
+                    .unwrap_or("")
                     .split(',')
                     .next()
                     .and_then(|n| n.parse::<usize>().ok())
@@ -165,56 +265,103 @@ fn align(rows: Vec<Row>, config: &DiffConfig, limits: &Limits) -> Vec<Row> {
         while i < rows.len() && rows[i].kind == "insert" {
             i += 1;
         }
-        let count = (split - begin).min(i - split);
         let bounded = (split - begin).saturating_mul(i - split) <= limits.max_alignment_cells;
-        for n in 0..(split - begin).max(i - split) {
-            if n < count && bounded {
-                let a = &rows[begin + n];
-                let b = &rows[split + n];
-                let old: String = a.left.iter().map(|s| s.text.as_str()).collect();
-                let new: String = b.right.iter().map(|s| s.text.as_str()).collect();
-                let (left, right) =
-                    if old.len().saturating_mul(new.len()) <= limits.max_alignment_cells {
-                        inline(&old, &new)
-                    } else {
-                        (span(&old, true), span(&new, true))
-                    };
-                out.push(Row {
-                    kind: "replace".into(),
-                    old: a.old,
-                    new: b.new,
-                    left,
-                    right,
-                    moved: None,
-                });
-            } else {
-                if n < split - begin {
-                    out.push(rows[begin + n].clone());
+        if !bounded {
+            out.push(Row {
+                kind: "hunk".into(),
+                old: None,
+                new: None,
+                left: span("alignment_budget_exceeded: original edits retained", false),
+                right: vec![],
+                moved: None,
+            });
+        }
+        for (a, b) in pairing(
+            &rows[begin..split],
+            &rows[split..i],
+            limits.max_alignment_cells,
+        ) {
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let a = &rows[begin + a];
+                    let b = &rows[split + b];
+                    let old: String = a.left.iter().map(|s| s.text.as_str()).collect();
+                    let new: String = b.right.iter().map(|s| s.text.as_str()).collect();
+                    let (left, right) =
+                        if old.len().saturating_mul(new.len()) <= limits.max_alignment_cells {
+                            inline(&old, &new)
+                        } else {
+                            (span(&old, true), span(&new, true))
+                        };
+                    out.push(Row {
+                        kind: "replace".into(),
+                        old: a.old,
+                        new: b.new,
+                        left,
+                        right,
+                        moved: None,
+                    });
                 }
-                if n < i - split {
-                    out.push(rows[split + n].clone());
-                }
+                (Some(a), None) => out.push(rows[begin + a].clone()),
+                (None, Some(b)) => out.push(rows[split + b].clone()),
+                _ => unreachable!(),
             }
         }
     }
     if config.moved_lines {
-        let mut deleted: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, r) in out.iter().enumerate() {
-            if r.kind == "delete" {
-                let s: String = r.left.iter().map(|s| s.text.as_str()).collect();
-                if s.trim().len() > 3 {
-                    deleted.entry(s).or_default().push(i);
-                }
+        let mut blocks: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
+        let mut cursor = 0;
+        while cursor < out.len() {
+            if out[cursor].kind != "delete" {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < out.len() && out[cursor].kind == "delete" {
+                cursor += 1;
+            }
+            let indices: Vec<_> = (start..cursor).collect();
+            let text = indices
+                .iter()
+                .map(|&i| {
+                    out[i]
+                        .left
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().len() > 3 {
+                blocks.entry(text).or_default().push(indices);
             }
         }
         let mut id = 0;
-        for i in 0..out.len() {
-            if out[i].kind == "insert" {
-                let s: String = out[i].right.iter().map(|s| s.text.as_str()).collect();
-                if let Some(indices) = deleted.get_mut(&s) {
-                    if let Some(j) = indices.pop() {
-                        id += 1;
-                        out[j].moved = Some(id);
+        cursor = 0;
+        while cursor < out.len() {
+            if out[cursor].kind != "insert" {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < out.len() && out[cursor].kind == "insert" {
+                cursor += 1;
+            }
+            let text = (start..cursor)
+                .map(|i| {
+                    out[i]
+                        .right
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(candidates) = blocks.get_mut(&text) {
+                if !candidates.is_empty() {
+                    let indices = candidates.remove(0);
+                    id += 1;
+                    for i in indices.into_iter().chain(start..cursor) {
                         out[i].moved = Some(id);
                     }
                 }
@@ -224,7 +371,7 @@ fn align(rows: Vec<Row>, config: &DiffConfig, limits: &Limits) -> Vec<Row> {
     out
 }
 
-fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
+pub(crate) fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
     match path.rsplit('.').next()? {
         "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), "C")),
         "cpp" | "cc" | "hpp" | "cxx" | "hh" => Some((tree_sitter_cpp::LANGUAGE.into(), "C++")),
@@ -233,100 +380,6 @@ fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
         "json" => Some((tree_sitter_json::LANGUAGE.into(), "JSON")),
         _ => None,
     }
-}
-
-fn syntax(
-    path: &str,
-    old: &[u8],
-    new: &[u8],
-    limits: &Limits,
-) -> Result<(SyntaxSummary, String), String> {
-    let (language, name) = grammar(path).ok_or("unsupported_language")?;
-    if std::str::from_utf8(old).is_err() || std::str::from_utf8(new).is_err() {
-        return Err("invalid_utf8".into());
-    }
-    let start = Instant::now();
-    let timeout = duration(&limits.syntax_timeout).map_err(|_| "syntax_budget_exceeded")?;
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|_| "grammar_error")?;
-    #[allow(deprecated)]
-    parser.set_timeout_micros(timeout.as_micros().min(u64::MAX as u128) as u64);
-    let mut sides = vec![];
-    for source in [old, new] {
-        let tree = parser.parse(source, None).ok_or("syntax_budget_exceeded")?;
-        if tree.root_node().has_error() {
-            return Err("parse_error".into());
-        }
-        let mut stack = vec![tree.root_node()];
-        let mut count = 0;
-        let mut tokens = vec![];
-        let mut structure = Vec::new();
-        let mut hashes = BTreeSet::new();
-        while let Some(node) = stack.pop() {
-            count += 1;
-            if count > limits.max_syntax_nodes || start.elapsed() > timeout {
-                return Err("syntax_budget_exceeded".into());
-            }
-            if node.kind().contains("comment") {
-                continue;
-            }
-            // Preorder node kinds plus significant child counts encode the
-            // tree shape without byte offsets or comments. Leaf tokens alone
-            // cannot distinguish Python indentation/control-flow changes.
-            let children = (0..node.child_count())
-                .filter_map(|i| node.child(i))
-                .filter(|child| !child.kind().contains("comment"))
-                .count();
-            structure.push((node.kind_id(), children));
-            if node.child_count() == 0 {
-                tokens.push(format!(
-                    "{}:{}",
-                    node.kind(),
-                    String::from_utf8_lossy(&source[node.byte_range()])
-                ));
-            } else {
-                if node.is_named() && node.end_byte() - node.start_byte() <= 8192 {
-                    hashes.insert(crate::hash(&source[node.byte_range()]));
-                }
-                for n in (0..node.child_count()).rev() {
-                    if let Some(c) = node.child(n) {
-                        stack.push(c);
-                    }
-                }
-            }
-        }
-        sides.push((tokens, hashes, structure));
-    }
-    if sides[0].0.len().saturating_mul(sides[1].0.len()) > limits.max_syntax_candidates {
-        return Err("syntax_budget_exceeded".into());
-    }
-    let a: Vec<_> = sides[0].0.iter().map(String::as_str).collect();
-    let b: Vec<_> = sides[1].0.iter().map(String::as_str).collect();
-    let ops = similar::capture_diff_slices_deadline(
-        similar::Algorithm::Myers,
-        &a,
-        &b,
-        Some(start + timeout),
-    );
-    let (mut deleted, mut inserted) = (0, 0);
-    for op in ops {
-        let (tag, old_range, new_range) = op.as_tag_tuple();
-        if tag != similar::DiffTag::Equal {
-            deleted += old_range.len();
-            inserted += new_range.len();
-        }
-    }
-    Ok((
-        SyntaxSummary {
-            unchanged_subtrees: sides[0].1.intersection(&sides[1].1).count(),
-            deleted_tokens: deleted,
-            inserted_tokens: inserted,
-            text_only_change: a == b && sides[0].2 == sides[1].2 && old != new,
-        },
-        name.into(),
-    ))
 }
 
 // The two source buffers carry independent original-file coordinates.
@@ -341,15 +394,15 @@ pub fn build(
     config: &DiffConfig,
     limits: &Limits,
 ) -> FileDiff {
-    let a = String::from_utf8_lossy(old);
-    let b = String::from_utf8_lossy(new);
     let mut note = String::new();
     let mut engine = "text".to_owned();
     let mut summary = None;
+    let mut matches = vec![];
     let mut language = grammar(path).map(|(_, s)| s.to_owned()).unwrap_or_default();
     if config.mode != "text" {
-        match syntax(path, old, new, limits) {
-            Ok((s, name)) => {
+        match crate::structural::compare(path, old, new, limits) {
+            Ok((s, name, syntax_matches)) => {
+                matches = syntax_matches;
                 engine = "syntax".into();
                 language = name;
                 summary = Some(s);
@@ -362,9 +415,64 @@ pub fn build(
     }
     let mut rows = match patch {
         Some(p) => patch_rows(p, config, limits),
-        None => text_rows(&a, &b, old_start, new_start, config, limits),
+        None => byte_rows(old, new, old_start, new_start, config, limits),
     };
+    if patch.is_some() && (old_start != 1 || new_start != 1) {
+        for row in &mut rows {
+            row.old = row.old.map(|n| n + old_start - 1);
+            row.new = row.new.map(|n| n + new_start - 1);
+            if row.kind == "hunk" {
+                for span in &mut row.left {
+                    let fields: Vec<_> = span.text.split_whitespace().collect();
+                    if fields.len() >= 3 {
+                        let coord = |token: &str, offset: usize| {
+                            let mut parts = token[1..].split(',');
+                            let n = parts.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+                            format!(
+                                "{}{},{}",
+                                &token[..1],
+                                if n == 0 { 0 } else { n + offset },
+                                parts.next().unwrap_or("1")
+                            )
+                        };
+                        span.text = format!(
+                            "@@ {} {} @@ scoped function",
+                            coord(fields[1], old_start - 1),
+                            coord(fields[2], new_start - 1)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if !old.is_empty() && !old.ends_with(b"\n") {
+        note.push_str(" · old source has no final newline");
+    }
+    if !new.is_empty() && !new.ends_with(b"\n") {
+        note.push_str(" · new source has no final newline");
+    }
     apply_highlights(path, old, new, old_start, new_start, &mut rows, limits);
+    let mut document = crate::document::DiffDocument::build(
+        path,
+        old,
+        new,
+        old_start,
+        new_start,
+        limits.max_alignment_cells,
+    );
+    document.hunks = match crate::projection::project(&rows, old, new, old_start, new_start) {
+        Ok(hunks) => hunks,
+        Err(_) => {
+            document
+                .quality
+                .push("presentation_projection_fallback".into());
+            rows = byte_rows(old, new, old_start, new_start, config, limits);
+            apply_highlights(path, old, new, old_start, new_start, &mut rows, limits);
+            crate::projection::project(&rows, old, new, old_start, new_start)
+                .expect("selected source coordinates")
+        }
+    };
+    document.syntax_matches = matches;
     FileDiff {
         path: path.into(),
         kind: if old.is_empty() {
@@ -384,6 +492,9 @@ pub fn build(
         new_start,
         language,
         syntax: summary,
+        continuation: None,
+        document: Some(document),
+        canonical_patch: patch.map(|p| STANDARD.encode(p)),
     }
 }
 

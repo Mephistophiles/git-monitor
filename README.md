@@ -116,18 +116,29 @@ MIME bytes and Message-ID are persisted before SMTP. Ambiguous attempts retain t
 - Identical selected old/new analyses are cached independently of watch names and recipient addresses. Event bindings remain separate.
 - Configuration is read once per process. Apply edits by stopping and restarting. SIGTERM/SIGINT stops new work, drains active work within `shutdown_grace`, and leaves unfinished jobs recoverable. SIGHUP is ignored.
 - Worker processes have address-space, execution-time, and output budgets. Oversized objects get explicit diagnostics; they do not become empty successful matches.
-- MIME parts are packed by file. A single item that cannot fit is replaced with an explicit `oversized_item` card; its full scoped report remains local. Other changes can still be delivered. Increase limits and use `retry-analysis --job ID` for completed or failed analysis jobs.
+- HTML/MIME generation runs in an isolated worker with `render_timeout`, `max_worker_address_space_bytes`, and `max_render_output_bytes` budgets. Files, hunks and long lines can continue across MIME parts; continuations record selected-source byte ranges, order and full-content SHA-256 hashes. Valid UTF-8 is split at character boundaries. If the part count cannot hold the result, an explicit `oversized_item` card is sent; full analysis remains in SQLite for retry.
 
 ```sh
 git-monitor --config examples/monitor.toml retry-analysis --job 42
 git-monitor --config examples/monitor.toml run --once --force
 ```
 
-Do not share a managed repository directory between unrelated state directories. Repository locks guard active caches. Object pins are intentionally retained in v0.1; automatic pin/cache retention and maintenance are not implemented yet.
+Do not share a managed repository directory between unrelated state directories. Repository locks guard active caches. Run `git-monitor --config monitor.toml maintain` between passes, or schedule it separately. It recovers fetch attempts first, expires completed/delivered history, bounds disposable cache entries, removes unbound old artifacts and temporary files, and releases unnecessary pins. Pending jobs, failed analysis and unsent/uncertain deliveries do not expire by age. `maintain --gc` also writes commit graphs, repacks and prunes managed Git caches under the repository locks.
 
-State databases upgrade automatically from schema 1 to 2 when opened by this version. Older binaries reject schema 2, preventing them from misinterpreting unfinished selected-branch attempts.
+Retention settings are `maintenance.history_days = 90`, `artifact_days = 30`, `temporary_hours = 24`, and `cache_items = 10000`. Retained jobs keep their input OIDs and remain retryable after GC. Jobs in expired completed history are no longer available to retry.
+
+State databases upgrade automatically to schema 3, including durable source epochs.
 
 ## Diff engine
+
+Published textual results carry a versioned byte-oriented `DiffDocument` with
+selected source ranges, hashes and ordered edits. Publication validates that
+edits reconstruct the complete allowed new bytes and stay within the selected
+scope. Whole-file reports export the canonical Git patch; function reports
+export a scoped JSON model rather than an applicable whole-file patch. Both
+file and function presentation use Git histogram with the configured context.
+Line pairing uses bounded token similarity, intraline edits preserve Unicode
+graphemes, and equal moved blocks share one deterministic move identifier.
 
 The application owns its typed diff model, HTML, CSS, and interaction code. Git supplies canonical file patches; native code handles line pairing, intraline highlighting, original coordinates, basic moved-line annotation, themes, copying, and exact byte exports. Selected function snippets use a bounded native line diff.
 
@@ -146,6 +157,15 @@ python3 scripts/coverage.py
 cargo build --release --locked
 cargo bench --bench baseline -- --save-baseline my-run
 python3 scripts/record-baseline.py --name my-run
+```
+
+Property tests exercise byte reconstruction, scope validation and selector set
+canonicalization. The fuzz target covers patch parsing, the byte document,
+HTML escaping and continuation splitting:
+
+```sh
+cargo check --manifest-path fuzz/Cargo.toml --locked
+cargo +nightly fuzz run invariants -- -max_total_time=60
 ```
 
 Integration tests create local Git repositories and a local SMTP fixture. They cover bootstrap/no-op behavior, multiple remotes, shared analysis, force-push/rollback, crash recovery, branch deletion, function scope, deletion/restoration, attributes, merge resolution, MIME limits, durable SMTP retries, hostile HTML, and bounded SIGTERM shutdown. Selected-branch cases additionally check excluded orphan objects, combined watches, coverage changes, empty observations, discovery/download races, incomplete staging, and atomic publication conflicts.
@@ -168,6 +188,29 @@ The browser checks side-by-side switching, themes, search, no-JS readability, an
 
 ## v0.1 boundaries
 
-This is the first executable implementation of [ARCHITECTURE.md](ARCHITECTURE.md), not every planned optimization. Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file patches use Git histogram; isolated function snippets use native Myers diff. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Oversized single-line byte-chunk delivery and automatic retention are deferred.
+Analysis cache identities include the Git version, dependency lockfile, analyzer
+source identity, model version, and explicitly allowed function rules. Local
+analysis ignores global Git diff settings; transport still uses standard SSH and
+credential helpers. Custom textual rules are configured as
+`execution.diff_drivers = { custom = '^FUNCTION .*' }` and are frozen per run.
+File patches honor `diff.context_lines`.
+
+Set `repositories.<id>.object_format = 'sha256'` for SHA-256 sources (default:
+`sha1`). All remotes in a logical repository must share the format. A remote's
+optional nonsecret `access_context` identifies its credential/visibility context;
+rotate it when that context changes. Source changes, including a later return to
+an earlier context, establish a fresh epoch and baseline. `doctor` performs
+offline capability probes, storage write checks, worker-limit and queue-integrity
+checks without contacting configured remotes or SMTP.
+
+This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis have bounded pools. Persistent operation runs fetch, analysis, reporting and SMTP on independent clocks with a dedicated SQLite command worker. Tokio owns process I/O, signals and timers. `new_branch_mode="compare"` requires explicit `defaults.base_remote` and `defaults.base_branch`; the base OID is frozen in the attempt and event. The default `summary` mode emits metadata only. Whole-file and function patches use Git histogram. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
 
 Licensed under [MIT](LICENSE).
+
+Immutable analysis inputs use a checksummed disk cache keyed by the frozen Git/lockfile/analyzer profile. Ref reads and network operations remain live. Blob reads are batched within object/output budgets; function selections and HTML file fragments have separate cache identities. `execution.share_computations=false` disables reuse for comparison with a naive run. `maintenance.cache_items` and `maintenance.cache_bytes` bound disposable caches. Operation counters and cumulative waited-child CPU/max RSS are recorded separately from timing claims.
+
+Current DiffDocument schema 3 contains selected source hashes/profile, byte edits, hunks, line pairs, source spans and syntax correspondences. Rendering reads selected bytes through these ranges; legacy rows remain a compatibility projection. Canonical histogram patches and normalized Myers reconstruction edits are separate representations. Structure annotations preserve all textual changes and carry evidence labels. Reports include native folding, local hunk/move navigation, event and aggregate filters, and repeated-commit ref provenance. Parse caches are disposable and bounded by maintenance.
+
+Planner microbenchmarks cover 1/10/100/1000 repeated and distinct selectors; these do not claim end-to-end Git timings. Integration tests exercise 1000 real identical watch bindings with one computation.
+
+The implementation/verification matrix is in [docs/architecture-implementation.md](docs/architecture-implementation.md); current measurements are in [restored-architecture-v3](benchmarks/baselines/restored-architecture-v3/README.md).

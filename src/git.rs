@@ -25,14 +25,81 @@ pub struct Changed {
     pub old_mode: String,
     pub new_mode: String,
 }
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Selection {
+    pub oid: String,
     pub bytes: Vec<u8>,
     pub start: usize,
+    pub offset: usize,
 }
 
 impl Git {
+    fn cache_key(&self, args: &[&str]) -> String {
+        let profile = if self.execution.analysis_profile.git.is_empty() {
+            crate::profile::AnalysisProfile::freeze(&self.execution.diff_drivers)
+                .expect("Git profile")
+        } else {
+            self.execution.analysis_profile.clone()
+        };
+        crate::hash(serde_json::to_vec(&("immutable-input-v1", profile.key(), args)).unwrap())
+    }
+    fn cached(&self, args: &[&str]) -> Option<Vec<u8>> {
+        if !self.execution.share_computations {
+            return None;
+        }
+        let value = crate::cache::get(
+            &self.path.join("git-monitor-cache"),
+            &self.cache_key(args),
+            self.limits.max_patch_bytes,
+        );
+        crate::metrics::update(|s| {
+            if value.is_some() {
+                s.input_cache_hits += 1
+            } else {
+                s.input_cache_misses += 1
+            }
+        });
+        value
+    }
+    fn save_cache(&self, args: &[&str], bytes: &[u8]) {
+        if self.execution.share_computations {
+            let _ = crate::cache::put(
+                &self.path.join("git-monitor-cache"),
+                &self.cache_key(args),
+                bytes,
+            );
+        }
+    }
+    fn immutable(args: &[&str]) -> bool {
+        let oid = |s: &str| [40, 64].contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let end = args.iter().position(|s| *s == "--").unwrap_or(args.len());
+        let positional: Vec<_> = args
+            .iter()
+            .take(end)
+            .skip(1)
+            .filter(|s| !s.starts_with('-'))
+            .copied()
+            .collect();
+        match args.first().copied() {
+            Some("show") => positional.len() == 1 && oid(positional[0]),
+            Some("diff") => positional.len() == 2 && positional.iter().all(|s| oid(s)),
+            Some("rev-list") => {
+                positional.len() == 1
+                    && positional[0]
+                        .split_once("..")
+                        .is_some_and(|(a, b)| oid(a) && oid(b))
+            }
+            Some("cat-file") => {
+                args.len() == 3 && ["blob", "-s"].contains(&args[1]) && oid(args[2])
+            }
+            Some("check-attr") => args.windows(2).any(|a| a[0] == "--source" && oid(a[1])),
+            _ => false,
+        }
+    }
     fn command(&self) -> Command {
+        self.command_for(false)
+    }
+    fn command_for(&self, network: bool) -> Command {
         let mut c = Command::new("git");
         c.arg("--no-pager")
             .arg("--literal-pathspecs")
@@ -53,9 +120,25 @@ impl Git {
             .env("LC_ALL", "C")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1");
+        if !network {
+            c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_DIFF_OPTS")
+                .env_remove("GIT_EXTERNAL_DIFF")
+                .env_remove("GIT_ATTR_SOURCE");
+        }
+        for (driver, expression) in &self.execution.diff_drivers {
+            c.args(["-c", &format!("diff.{driver}.xfuncname={expression}")]);
+        }
         c
     }
     pub fn raw(&self, args: &[&str]) -> Result<Vec<u8>> {
+        if Self::immutable(args) {
+            if let Some(bytes) = self.cached(args) {
+                return Ok(bytes);
+            }
+        }
         let out = process::run(
             self.command().args(args),
             duration(&self.execution.git_timeout)?,
@@ -69,6 +152,9 @@ impl Git {
             "Git operation failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        if Self::immutable(args) {
+            self.save_cache(args, &out.stdout);
+        }
         Ok(out.stdout)
     }
     pub fn text(&self, args: &[&str]) -> Result<String> {
@@ -91,10 +177,19 @@ impl Git {
         Ok(out.stdout)
     }
     pub fn init(&self) -> Result<()> {
+        self.init_format("sha1")
+    }
+    pub fn init_format(&self, format: &str) -> Result<()> {
         if !self.path.exists() {
             std::fs::create_dir_all(self.path.parent().context("repository parent")?)?;
             let mut c = Command::new("git");
-            c.args(["init", "--bare", "--quiet"]).arg(&self.path);
+            c.args([
+                "init",
+                "--bare",
+                "--quiet",
+                &format!("--object-format={format}"),
+            ])
+            .arg(&self.path);
             let out = process::run(
                 &mut c,
                 duration(&self.execution.git_timeout)?,
@@ -105,6 +200,10 @@ impl Git {
             )?;
             ensure!(out.code == 0, "git init failed");
         }
+        ensure!(
+            self.text(&["rev-parse", "--show-object-format"])?.trim() == format,
+            "managed repository object format differs from configuration"
+        );
         self.raw(&["config", "gc.auto", "0"])?;
         self.raw(&["config", "maintenance.auto", "false"])?;
         Ok(())
@@ -143,7 +242,7 @@ impl Git {
         remote: &str,
         bootstrap: bool,
     ) -> Result<Vec<u8>> {
-        let mut c = self.command();
+        let mut c = self.command_for(true);
         c.args(args);
         let timeout = if bootstrap {
             &self.execution.bootstrap_timeout
@@ -457,7 +556,7 @@ impl Git {
         }
         Ok(result)
     }
-    pub fn show_patch(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
+    pub fn show_patch(&self, commit: &str, path: &str, context: usize) -> Result<Vec<u8>> {
         self.raw(&[
             "show",
             "--format=",
@@ -468,11 +567,42 @@ impl Git {
             "--no-ext-diff",
             "--no-textconv",
             "--diff-algorithm=histogram",
-            "--unified=3",
+            &format!("--unified={context}"),
             commit,
             "--",
             path,
         ])
+    }
+    pub fn snippet_patch(&self, old: &[u8], new: &[u8], context: usize) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let mut a = tempfile::NamedTempFile::new()?;
+        let mut b = tempfile::NamedTempFile::new()?;
+        a.write_all(old)?;
+        b.write_all(new)?;
+        let output = process::run(
+            self.command()
+                .args([
+                    "diff",
+                    "--no-index",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--diff-algorithm=histogram",
+                    &format!("--unified={context}"),
+                ])
+                .arg(a.path())
+                .arg(b.path()),
+            duration(&self.execution.git_timeout)?,
+            self.limits.max_patch_bytes,
+            &self.shutdown,
+            duration(&self.execution.shutdown_grace)?,
+            None,
+        )?;
+        ensure!(
+            output.code == 0 || output.code == 1,
+            "cannot generate scoped histogram diff"
+        );
+        Ok(output.stdout)
     }
     pub fn blob(&self, oid: Option<&str>) -> Result<Vec<u8>> {
         let Some(oid) = oid else {
@@ -483,7 +613,99 @@ impl Git {
             size <= self.limits.max_blob_bytes,
             "blob budget exceeded ({size} bytes)"
         );
+        if let Some(bytes) = self.cached(&["cat-file", "blob", oid]) {
+            return Ok(bytes);
+        }
+        crate::metrics::update(|s| s.blob_reads += 1);
         self.raw(&["cat-file", "blob", oid])
+    }
+    pub fn prefetch_blobs(&self, oids: &BTreeSet<String>) -> Result<()> {
+        if !self.execution.share_computations {
+            return Ok(());
+        }
+        let missing: Vec<_> = oids
+            .iter()
+            .filter(|oid| self.cached(&["cat-file", "blob", oid]).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let input = missing
+            .iter()
+            .map(|oid| format!("{oid}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let sizes = String::from_utf8(self.raw_input(
+            &[
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ],
+            input,
+        )?)?;
+        let mut batch = vec![];
+        let mut bytes = 0usize;
+        for line in sizes.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 || fields[1] != "blob" {
+                continue;
+            }
+            let size: usize = fields[2].parse()?;
+            if size > self.limits.max_blob_bytes
+                || size.saturating_add(256) > self.limits.max_patch_bytes
+            {
+                continue;
+            }
+            if bytes.saturating_add(size).saturating_add(256) > self.limits.max_patch_bytes {
+                self.read_blob_batch(&batch)?;
+                batch.clear();
+                bytes = 0;
+            }
+            batch.push(fields[0].to_owned());
+            bytes += size + 256;
+        }
+        self.read_blob_batch(&batch)
+    }
+    fn read_blob_batch(&self, oids: &[String]) -> Result<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        let input = oids
+            .iter()
+            .map(|oid| format!("{oid}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let output = self.raw_input(&["cat-file", "--batch"], input)?;
+        let mut offset = 0;
+        for oid in oids {
+            let end = output[offset..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .context("incomplete blob header")?
+                + offset;
+            let fields: Vec<_> = std::str::from_utf8(&output[offset..end])?
+                .split_whitespace()
+                .collect();
+            ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "unexpected batch object"
+            );
+            let size: usize = fields[2].parse()?;
+            offset = end + 1;
+            ensure!(
+                size <= self.limits.max_blob_bytes
+                    && offset
+                        .checked_add(size)
+                        .is_some_and(|end| end < output.len()),
+                "incomplete blob body"
+            );
+            self.save_cache(&["cat-file", "blob", oid], &output[offset..offset + size]);
+            offset += size;
+            ensure!(output[offset] == b'\n', "invalid batch delimiter");
+            offset += 1;
+            crate::metrics::update(|s| s.blob_reads += 1);
+        }
+        ensure!(offset == output.len(), "unexpected trailing batch data");
+        Ok(())
     }
     pub fn tree(&self, rev: &str) -> Result<String> {
         Ok(self
@@ -492,18 +714,72 @@ impl Git {
             .into())
     }
     pub fn tree_blob(&self, rev: &str, path: &str) -> Result<Option<String>> {
-        let spec = format!("{rev}:{path}");
-        let out = process::run(
-            self.command().args(["rev-parse", "--verify", &spec]),
-            duration(&self.execution.git_timeout)?,
-            65536,
-            &self.shutdown,
-            duration(&self.execution.shutdown_grace)?,
+        let records = self.raw(&["ls-tree", "-z", rev, "--", path])?;
+        for record in records.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let tab = record
+                .iter()
+                .position(|b| *b == b'\t')
+                .context("invalid tree entry")?;
+            if &record[tab + 1..] != path.as_bytes() {
+                continue;
+            }
+            let fields: Vec<_> = std::str::from_utf8(&record[..tab])?
+                .split_whitespace()
+                .collect();
+            ensure!(
+                fields.len() == 3 && fields[1] == "blob",
+                "function path is not a blob"
+            );
+            return Ok(Some(fields[2].into()));
+        }
+        Ok(None)
+    }
+    pub fn fetch_base(&self, remote: &str, branch: &str) -> Result<String> {
+        let reference = format!("refs/heads/{branch}");
+        self.raw(&["check-ref-format", &reference])?;
+        let target = format!(
+            "refs/git-monitor/bases/{}",
+            crate::hash(format!("{remote}:{branch}"))
+        );
+        self.network(
+            &[
+                "fetch",
+                "--atomic",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--refmap=",
+                remote,
+                &format!("+{reference}:{target}"),
+            ],
             None,
+            remote,
+            false,
         )?;
-        Ok((out.code == 0).then(|| String::from_utf8_lossy(&out.stdout).trim().into()))
+        let oid = self
+            .ref_oid(&target)?
+            .context("comparison base unavailable")?;
+        self.pin(&oid)?;
+        Ok(oid)
     }
     pub fn select(&self, rev: Option<&str>, f: &Function) -> Result<Option<Selection>> {
+        let Some(rev) = rev else {
+            return Ok(None);
+        };
+        if ![40, 64].contains(&rev.len()) || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return self.select_inner(Some(rev), f);
+        }
+        let key = ["selected-range-v1", rev, &f.path, &f.expression];
+        if let Some(bytes) = self.cached(&key) {
+            if let Ok(value) = serde_json::from_slice(&bytes) {
+                return Ok(value);
+            }
+        }
+        let result = self.select_inner(Some(rev), f)?;
+        self.save_cache(&key, &serde_json::to_vec(&result)?);
+        Ok(result)
+    }
+    fn select_inner(&self, rev: Option<&str>, f: &Function) -> Result<Option<Selection>> {
         let Some(rev) = rev else {
             return Ok(None);
         };
@@ -589,8 +865,10 @@ impl Git {
         let begin = lines[start - 1].0;
         let end = lines[start - 1 + count - 1].1;
         Ok(Some(Selection {
+            oid,
             bytes: bytes[begin..end].to_vec(),
             start,
+            offset: begin,
         }))
     }
 }

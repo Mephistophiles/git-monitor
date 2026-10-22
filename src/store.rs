@@ -28,6 +28,8 @@ pub struct Attempt {
     pub diff: DiffConfig,
     #[serde(default)]
     pub plan: FetchPlan,
+    #[serde(default)]
+    pub comparison_base: Option<crate::model::ComparisonBase>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,6 +94,8 @@ pub struct Task {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Analysis {
+    #[serde(default)]
+    pub counters: crate::metrics::Counters,
     pub commits: Vec<CommitView>,
     pub files: Vec<FileDiff>,
     pub outgoing: Vec<String>,
@@ -112,6 +116,15 @@ pub type Snapshot = (BTreeMap<String, String>, BTreeMap<String, Watch>, u64);
 pub fn source_key(repository: &str, remote: &str, url: &str) -> String {
     crate::hash(format!("{repository}\0{remote}\0{url}"))
 }
+pub fn source_identity(repository: &str, remote: &str, source: &crate::config::Remote) -> String {
+    if source.access_context.is_empty() {
+        source_key(repository, remote, &source.url)
+    } else {
+        crate::hash(
+            serde_json::to_vec(&(repository, remote, &source.url, &source.access_context)).unwrap(),
+        )
+    }
+}
 
 impl Store {
     pub fn open(state: &Path) -> Result<Self> {
@@ -122,7 +135,7 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 2, "state database is newer than this binary");
+        ensure!(version <= 3, "state database is newer than this binary");
         db.execute_batch("BEGIN;
           CREATE TABLE IF NOT EXISTS snapshots(key TEXT PRIMARY KEY, refs TEXT NOT NULL, watches TEXT NOT NULL, checked INTEGER NOT NULL, error TEXT);
           CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, context TEXT NOT NULL);
@@ -133,7 +146,18 @@ impl Store {
           CREATE TABLE IF NOT EXISTS matches(id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL, watch_id TEXT NOT NULL, recipient TEXT NOT NULL, source_key TEXT NOT NULL, watch TEXT NOT NULL, body TEXT NOT NULL, digest TEXT, UNIQUE(event_id,watch_id,recipient));
           CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, recipient TEXT NOT NULL, revision TEXT NOT NULL, digest TEXT NOT NULL, mime BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
           CREATE TABLE IF NOT EXISTS clocks(recipient TEXT PRIMARY KEY, last_digest INTEGER NOT NULL);
-          PRAGMA user_version=2; COMMIT;")?;
+          CREATE TABLE IF NOT EXISTS active_sources(repository TEXT NOT NULL, remote TEXT NOT NULL, identity TEXT NOT NULL, key TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(repository,remote));
+          CREATE TABLE IF NOT EXISTS maintenance_log(id INTEGER PRIMARY KEY,body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS delivery_times(digest TEXT PRIMARY KEY,created INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS stage_metrics(id INTEGER PRIMARY KEY,stage TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS computations(key TEXT PRIMARY KEY,generation INTEGER NOT NULL,token TEXT NOT NULL,state TEXT NOT NULL,expires INTEGER NOT NULL,result_hash TEXT);
+          CREATE TABLE IF NOT EXISTS watch_jobs(job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,computation TEXT NOT NULL,selector TEXT NOT NULL);
+          PRAGMA user_version=3; COMMIT;")?;
+        db.execute(
+            "INSERT OR IGNORE INTO delivery_times SELECT DISTINCT digest,? FROM deliveries",
+            [crate::now()],
+        )?;
+        db.execute("UPDATE computations SET state='pending',generation=generation+1,token='' WHERE state='running'",[])?;
         // A single instance owns the DB; any running jobs were interrupted.
         db.execute("UPDATE jobs SET state='pending' WHERE state='running'", [])?;
         db.execute(
@@ -154,8 +178,75 @@ impl Store {
         row.map(|(r, w, t)| Ok((serde_json::from_str(&r)?, serde_json::from_str(&w)?, t)))
             .transpose()
     }
+    pub fn activate_source(
+        &self,
+        repository: &str,
+        remote: &str,
+        identity: &str,
+    ) -> Result<String> {
+        let old: Option<(String, String, i64)> = self
+            .db
+            .query_row(
+                "SELECT identity,key,epoch FROM active_sources WHERE repository=? AND remote=?",
+                params![repository, remote],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((previous, key, _)) = &old {
+            if previous == identity {
+                return Ok(key.clone());
+            }
+        }
+        let epoch = old.map_or(0, |(_, _, epoch)| epoch + 1);
+        let key = if epoch == 0 {
+            identity.to_owned()
+        } else {
+            crate::hash(format!("{identity}\0{epoch}"))
+        };
+        self.db.execute("INSERT INTO active_sources VALUES(?,?,?,?,?) ON CONFLICT(repository,remote) DO UPDATE SET identity=excluded.identity,key=excluded.key,epoch=excluded.epoch",
+            params![repository,remote,identity,key,epoch])?;
+        Ok(key)
+    }
+    pub fn retire_disabled_sources(&self, cfg: &Config) -> Result<()> {
+        let rows: Vec<(String, String)> = self
+            .db
+            .prepare(
+                "SELECT repository,remote FROM active_sources WHERE identity NOT LIKE 'inactive:%'",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for (repository, remote) in rows {
+            if !cfg
+                .repositories
+                .get(&repository)
+                .is_some_and(|r| r.remotes.contains_key(&remote))
+                || !cfg
+                    .watches
+                    .iter()
+                    .any(|w| w.repository == repository && w.remotes.contains(&remote))
+            {
+                self.db.execute("UPDATE active_sources SET identity='inactive:' || identity WHERE repository=? AND remote=?",params![repository,remote])?;
+            }
+        }
+        Ok(())
+    }
+    pub fn active_source(&self, repository: &str, remote: &str, identity: &str) -> Result<String> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT key FROM active_sources WHERE repository=? AND remote=? AND identity=?",
+                params![repository, remote, identity],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| identity.to_owned()))
+    }
+    pub fn begin_poll(&self, key: &str, repository: &str, remote: &str) -> Result<()> {
+        self.db.execute("INSERT INTO remote_status(key,repository,remote,last_attempt,next_poll) VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET last_attempt=excluded.last_attempt,next_poll=excluded.next_poll",params![key,repository,remote,crate::now(),crate::now()+1])?;
+        Ok(())
+    }
     pub fn begin(&self, a: &Attempt) -> Result<i64> {
-        self.db.execute("INSERT INTO remote_status(key,repository,remote,last_attempt,next_poll) VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET last_attempt=excluded.last_attempt,next_poll=excluded.next_poll",params![a.key,a.repository,a.remote,crate::now(),crate::now()+1])?;
+        self.begin_poll(&a.key, &a.repository, &a.remote)?;
         self.db.execute(
             "INSERT INTO attempts(key,context) VALUES(?,?)",
             params![a.key, serde_json::to_string(a)?],
@@ -226,6 +317,11 @@ impl Store {
                     old,
                     new: next,
                     observed_at: crate::now(),
+                    comparison_base: if kind == "branch_created" {
+                        a.comparison_base.clone()
+                    } else {
+                        None
+                    },
                     watches: vec![],
                     commits: vec![],
                     outgoing: vec![],
@@ -316,7 +412,53 @@ impl Store {
             .optional()?
             .unwrap_or(0))
     }
+    pub fn claim_computation(
+        &mut self,
+        key: &str,
+        bindings: &[(i64, Task)],
+        seconds: u64,
+    ) -> Result<String> {
+        let tx = self.db.transaction()?;
+        let generation: i64 = tx
+            .query_row(
+                "SELECT generation FROM computations WHERE key=?",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            + 1;
+        let token = crate::hash(format!(
+            "{key}:{generation}:{}:{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        tx.execute("INSERT INTO computations VALUES(?,?,?,'running',?,NULL) ON CONFLICT(key) DO UPDATE SET generation=excluded.generation,token=excluded.token,state='running',expires=excluded.expires,result_hash=NULL",params![key,generation,token,crate::now().saturating_add(seconds)])?;
+        for (id, task) in bindings {
+            tx.execute(
+                "INSERT OR REPLACE INTO watch_jobs VALUES(?,?,?)",
+                params![id, key, task.watch.selector_key()],
+            )?;
+            tx.execute("UPDATE jobs SET state='running' WHERE id=?", [id])?;
+        }
+        tx.commit()?;
+        Ok(token)
+    }
+    pub fn owns_computation(&self, key: &str, token: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM computations WHERE key=? AND token=? AND state='running' AND expires>=?)",params![key,token,crate::now()],|r|r.get(0))?)
+    }
+    pub fn release_computation(
+        &self,
+        key: &str,
+        token: &str,
+        result: Option<&Analysis>,
+    ) -> Result<()> {
+        self.db.execute("UPDATE computations SET state=?,result_hash=? WHERE key=? AND token=? AND state='running'",params![if result.is_some(){"done"}else{"pending"},result.map(|r|crate::hash(serde_json::to_vec(r).unwrap())),key,token])?;
+        Ok(())
+    }
     pub fn jobs(&self) -> Result<Vec<(i64, Task)>> {
+        self.db.execute("UPDATE jobs SET state='pending' WHERE state='running' AND id IN (SELECT w.job_id FROM watch_jobs w JOIN computations c ON c.key=w.computation WHERE c.state='running' AND c.expires<?)",[crate::now()])?;
+        self.db.execute("UPDATE computations SET state='pending',generation=generation+1,token='' WHERE state='running' AND expires<?",[crate::now()])?;
         let mut q = self
             .db
             .prepare("SELECT id,task FROM jobs WHERE state='pending' ORDER BY id")?;
@@ -345,6 +487,13 @@ impl Store {
         error: Option<&str>,
         cfg: &Config,
     ) -> Result<()> {
+        for file in result
+            .files
+            .iter()
+            .chain(result.commits.iter().flat_map(|c| &c.files))
+        {
+            file.validate()?;
+        }
         let mut event = task.event.clone();
         event.watches = vec![task.watch.id.clone()];
         event.commits = result.commits.clone();
@@ -363,7 +512,15 @@ impl Store {
                 && w.repository == event.repository
         });
         let tx = self.db.transaction()?;
-        if error.is_none() {
+        if error.is_none() && cfg.execution.share_computations {
+            tx.execute(
+                "INSERT OR IGNORE INTO computations VALUES(?,0,'','done',0,?)",
+                params![key, crate::hash(serde_json::to_vec(result)?)],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO watch_jobs VALUES(?,?,?)",
+                params![id, key, task.watch.selector_key()],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO cache(key,body) VALUES(?,?)",
                 params![key, serde_json::to_string(result)?],
@@ -483,6 +640,14 @@ impl Store {
             ));
         }
         Ok(out)
+    }
+    pub fn record_metrics(&self, stage: &str, counters: &crate::metrics::Counters) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO stage_metrics(stage,created,body) VALUES(?,?,?)",
+            params![stage, crate::now(), serde_json::to_string(counters)?],
+        )?;
+        self.db.execute("DELETE FROM stage_metrics WHERE id NOT IN (SELECT id FROM stage_metrics ORDER BY id DESC LIMIT 1000)",[])?;
+        Ok(())
     }
     pub fn retry_job(&self, id: i64) -> Result<()> {
         ensure!(

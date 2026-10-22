@@ -32,6 +32,22 @@ jobs:
             target/coverage/html/
           if-no-files-found: warn
       - run: cargo build --release --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-save --package-lock=false playwright@1.62.1
+      - run: npx playwright install --with-deps chromium
+      - name: Fresh offline browser report
+        run: |
+          python3 scripts/demo.py --binary target/release/git-monitor
+          node scripts/screenshots.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-report
+          path: |
+            docs/example-report.html
+            docs/report-*.png
 
   msrv:
     runs-on: ubuntu-latest

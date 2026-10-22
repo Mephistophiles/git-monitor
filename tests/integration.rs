@@ -35,6 +35,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 impl Fixture {
     fn new(function: bool) -> Self {
+        git_monitor::process::set_worker_executable(PathBuf::from(BIN));
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let work = root.join("work");
@@ -130,6 +131,7 @@ impl Fixture {
             published: git.refs("origin").unwrap(),
             initialized: true,
             plan: FetchPlan::for_watches(&cfg.watches),
+            comparison_base: None,
             watches: cfg.watches,
             previous,
             execution: cfg.execution,
@@ -783,6 +785,7 @@ fn recovery_precedes_refetch_after_remote_rollback() {
         limits: cfg.limits.clone(),
         diff: cfg.diff.clone(),
         plan: FetchPlan::All,
+        comparison_base: None,
     };
     let id = store.begin(&attempt).unwrap();
     // A pending attempt saved by schema 1 has no fetch-plan field.
@@ -809,7 +812,7 @@ fn recovery_precedes_refetch_after_remote_rollback() {
         f.db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 mod git {
@@ -1500,6 +1503,326 @@ fn config_rejects_bad_ids_and_conflicting_selectors() {
 }
 
 #[test]
+fn profile_identity_covers_versions_and_allowed_driver_rules() {
+    let p = git_monitor::profile::AnalysisProfile::freeze(&Default::default()).unwrap();
+    assert!(!p.git.is_empty());
+    for field in ["git", "analyzer", "dependencies", "drivers", "model"] {
+        let mut next = p.clone();
+        match field {
+            "git" => next.git.push_str(" changed"),
+            "analyzer" => next.analyzer.push('1'),
+            "dependencies" => next.dependencies.push('1'),
+            "drivers" => {
+                next.drivers.insert("custom".into(), "^FUNC".into());
+            }
+            _ => next.model += 1,
+        }
+        assert_ne!(p.key(), next.key(), "{field}");
+    }
+}
+
+#[test]
+fn doctor_checks_existing_queue_integrity_without_network() {
+    let f = Fixture::new(false);
+    f.ok();
+    let check = || {
+        Command::new(BIN)
+            .arg("--config")
+            .arg(&f.config)
+            .arg("doctor")
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("queue integrity OK"));
+    f.db()
+        .execute(
+            "INSERT INTO jobs(event_id,watch_id,task) VALUES(999999,'orphan','{}')",
+            [],
+        )
+        .unwrap();
+    let output = check();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("orphaned analysis jobs"));
+}
+
+#[test]
+fn global_function_rules_do_not_override_frozen_analysis() {
+    let f = Fixture::new(true);
+    std::fs::write(f.work.join(".gitattributes"), "*.c diff=cpp\n").unwrap();
+    f.change(BEFORE, "Set built-in function rules");
+    f.ok();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Frozen rules");
+    let global = f.root.join("host.gitconfig");
+    std::fs::write(&global, "[diff \"cpp\"]\n  xfuncname = ^NOT_A_FUNCTION$\n").unwrap();
+    let output = Command::new(BIN)
+        .arg("--config")
+        .arg(&f.config)
+        .args(["run", "--once", "--force"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(f.report().contains("Frozen rules"));
+    assert!(!f.report().contains("analysis_failed"));
+}
+
+#[test]
+fn configured_file_context_is_respected() {
+    let f = Fixture::new(false);
+    f.ok();
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(&f.config, format!("{text}\n[diff]\ncontext_lines=0\n")).unwrap();
+    f.change(&BEFORE.replace("value > 0", "value >= 0"), "Zero context");
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert!(!event.commits[0].files[0]
+        .rows
+        .iter()
+        .any(|r| r.kind == "context"));
+}
+
+#[test]
+fn function_document_has_exact_original_scope_and_no_whole_file_patch() {
+    let f = Fixture::new(true);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace("match = 'target'", "match = 'PRIVATE_NEIGHBOR'");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    f.change(
+        &BEFORE.replace("return 900", "return 901"),
+        "Second function scope",
+    );
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    let file = &event.commits[0].files[0];
+    file.validate().unwrap();
+    let doc = file.document.as_ref().unwrap();
+    assert!(doc.old.original_range.start > 0);
+    assert!(doc.old.start_line > 1);
+    assert!(doc.old.blob.is_some());
+    assert!(file.canonical_patch.is_none());
+}
+
+#[test]
+fn maintenance_keeps_pending_results_and_gc_preserves_queued_objects() {
+    let f = Fixture::new(false);
+    f.ok();
+    let base = git(&f.work, &["rev-parse", "HEAD"]);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1"),
+        "Queued before rollback",
+    );
+    let cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    git(&f.work, &["reset", "--hard", &base]);
+    std::fs::write(
+        f.work.join("test.c"),
+        BEFORE.replace("value > 0", "value > 2"),
+    )
+    .unwrap();
+    git(&f.work, &["commit", "-qam", "Replacement"]);
+    git(&f.work, &["push", "--force", "-q", "origin", "main"]);
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    let summary =
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    assert_eq!(summary.events, 0);
+    assert_eq!(store.jobs().unwrap().len(), 2);
+    drop(store);
+    f.ok();
+    assert!(f.report().contains("Queued before rollback"));
+    assert!(!f.report().contains("analysis_failed"));
+}
+
+#[test]
+fn maintenance_expires_completed_history_and_cleans_only_unbound_artifacts() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1"),
+        "Retained pending result",
+    );
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    cfg.maintenance.history_days = 0;
+    cfg.maintenance.artifact_days = 0;
+    cfg.maintenance.temporary_hours = 0;
+    cfg.maintenance.cache_items = 0;
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE events SET body=json_set(body,'$.observed_at',0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), false)
+            .unwrap()
+            .events,
+        0
+    );
+    store
+        .db
+        .execute("UPDATE matches SET digest='delivered-test'", [])
+        .unwrap();
+    store.db.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime,state) VALUES('pending-test','alice','test','protected','mime','uncertain')",[]).unwrap();
+    store.db.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime,state) VALUES('sent-test','alice','test','expired','mime','sent')",[]).unwrap();
+    store
+        .db
+        .execute("INSERT INTO delivery_times VALUES('expired',0)", [])
+        .unwrap();
+    let artifacts = cfg.storage.state_dir.join("artifacts");
+    std::fs::write(artifacts.join("orphan.html"), "orphan").unwrap();
+    std::fs::write(artifacts.join("protected-1.html"), "pending attachment").unwrap();
+    std::fs::write(cfg.storage.state_dir.join("tmp/orphan.tmp"), "orphan").unwrap();
+    let result =
+        git_monitor::maintenance::run(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    assert_eq!(result.events, 1);
+    assert!(result.files >= 2);
+    assert!(result.pins > 0);
+    assert!(artifacts.join("alice-latest.html").exists());
+    assert!(artifacts.join("protected-1.html").exists());
+    assert!(!artifacts.join("orphan.html").exists());
+    assert_eq!(f.count("cache"), 0);
+    assert_eq!(f.count("jobs"), 0);
+    assert_eq!(f.count("deliveries"), 1);
+}
+
+#[test]
+fn report_worker_budget_creates_a_diagnostic_without_blocking_the_run() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Saved scoped analysis",
+    );
+    let text = std::fs::read_to_string(&f.config).unwrap();
+    std::fs::write(
+        &f.config,
+        format!("{text}\n[limits]\nmax_render_output_bytes=1\n"),
+    )
+    .unwrap();
+    f.ok();
+    assert!(f.report().contains("rendering/packaging exceeded"));
+    let count: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM matches WHERE body LIKE '%Saved scoped analysis%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "render failure cannot discard full analysis");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    assert!(f.report().contains("Saved scoped analysis"));
+}
+
+#[test]
+fn source_context_rotation_and_return_create_fresh_epochs() {
+    let f = Fixture::new(false);
+    f.ok();
+    let mut cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let remote = cfg.repositories["project"].remotes["origin"].clone();
+    let identity = git_monitor::store::source_identity("project", "origin", &remote);
+    let a = store.active_source("project", "origin", &identity).unwrap();
+    cfg.repositories
+        .get_mut("project")
+        .unwrap()
+        .remotes
+        .get_mut("origin")
+        .unwrap()
+        .access_context = "restricted".into();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Context change baseline",
+    );
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true)
+            .unwrap()
+            .0,
+        0
+    );
+    cfg.repositories
+        .get_mut("project")
+        .unwrap()
+        .remotes
+        .get_mut("origin")
+        .unwrap()
+        .access_context
+        .clear();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_ne!(
+        store.active_source("project", "origin", &identity).unwrap(),
+        a
+    );
+}
+
+#[test]
+fn sha256_git_cache_matches_the_configured_object_format() {
+    let f = Fixture::new(false);
+    let source = f.root.join("sha256.git");
+    git(
+        &f.root,
+        &[
+            "init",
+            "--bare",
+            "--object-format=sha256",
+            "-q",
+            source.to_str().unwrap(),
+        ],
+    );
+    git(&source, &["config", "user.name", "Test"]);
+    git(&source, &["config", "user.email", "test@example.invalid"]);
+    let tree = git(&source, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+    let oid = git(&source, &["commit-tree", &tree, "-m", "SHA256"]);
+    git(&source, &["update-ref", "refs/heads/main", &oid]);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[repositories.project.remotes.origin]",
+            "[repositories.project]\nobject_format='sha256'\n[repositories.project.remotes.origin]",
+        )
+        .replace(f.remote.to_str().unwrap(), source.to_str().unwrap());
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    assert_eq!(oid.len(), 64);
+    assert_eq!(
+        git(
+            &f.root.join("repos/project.git"),
+            &["rev-parse", "--show-object-format"]
+        ),
+        "sha256"
+    );
+}
+
+#[test]
 fn unrelated_root_history_is_analyzed_after_force_push() {
     let f = Fixture::new(false);
     f.ok();
@@ -1534,6 +1857,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
     let f = Fixture::new(false);
     let mut cfg = Config::load(&f.config).unwrap();
     cfg.defaults.max_message_bytes = 40000;
+    cfg.limits.max_part_count = 2;
     let mail = git_monitor::mail::MailConfig {
         version: 1,
         smtp: git_monitor::mail::Smtp {
@@ -1556,6 +1880,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
         old: None,
         new: None,
         observed_at: 0,
+        comparison_base: None,
         watches: vec!["runtime".into()],
         commits: vec![],
         outgoing: vec![],
@@ -1579,7 +1904,7 @@ fn mime_parts_fit_and_oversized_items_do_not_loop() {
     };
     let parts = git_monitor::mail::package(&report, &cfg.recipients["alice"], &mail, &cfg).unwrap();
     assert!(parts.iter().all(|p| p.1.len() <= 40000));
-    assert!(parts[0].2.contains("MIME item exceeds"));
+    assert!(parts[0].2.contains("oversized_item"));
 }
 
 #[test]
@@ -1796,4 +2121,529 @@ fn check_fetch_shutdown(selected: bool, orphan: bool) {
     f.ok();
     assert_eq!(f.count("attempts"), 0);
     assert_eq!(f.count("events"), 1);
+}
+
+#[test]
+fn immutable_cache_reuses_objects_and_never_caches_refs() {
+    let f = Fixture::new(false);
+    f.ok();
+    let oid = git(&f.work, &["rev-parse", "HEAD"]);
+    let cfg = Config::load(&f.config).unwrap();
+    let mut repository = Git {
+        path: repository_path(&cfg.storage.repositories_dir, "project"),
+        execution: cfg.execution,
+        limits: cfg.limits,
+        shutdown: Shutdown::default(),
+    };
+    git_monitor::metrics::reset();
+    let first = repository.metadata(&oid).unwrap();
+    let operations = git_monitor::metrics::snapshot().git_processes;
+    assert_eq!(first, repository.metadata(&oid).unwrap());
+    assert_eq!(git_monitor::metrics::snapshot().git_processes, operations);
+    repository.refs("origin").unwrap();
+    repository.refs("origin").unwrap();
+    assert!(git_monitor::metrics::snapshot().git_processes >= operations + 2);
+    repository.execution.share_computations = false;
+    repository.metadata(&oid).unwrap();
+    assert!(git_monitor::metrics::snapshot().git_processes > operations + 2);
+}
+#[test]
+fn shared_analysis_has_the_same_content_as_naive_analysis() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value >= 0"),
+        "Shared computation",
+    );
+    let cfg = Config::load(&f.config).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    git_monitor::monitor::collect(&cfg, &mut store, &Shutdown::default(), true).unwrap();
+    let (_, mut task) = store.jobs().unwrap().remove(0);
+    let shared = git_monitor::monitor::analyze(&task).unwrap();
+    task.execution.share_computations = false;
+    let naive = git_monitor::monitor::analyze(&task).unwrap();
+    assert_eq!(
+        serde_json::to_value(&shared.commits).unwrap(),
+        serde_json::to_value(&naive.commits).unwrap()
+    );
+}
+#[test]
+fn thousand_bindings_share_a_computation_and_cached_bindings_migrate() {
+    let f = Fixture::new(false);
+    let mut cfg = Config::load(&f.config).unwrap();
+    let original = cfg.watches[0].clone();
+    for i in 1..1000 {
+        let mut watch = original.clone();
+        watch.id = format!("watch_{i}");
+        cfg.watches.push(watch);
+    }
+    std::fs::write(&f.config, toml::to_string(&cfg).unwrap()).unwrap();
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1000"),
+        "Shared thousand",
+    );
+    let output = f.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=1"));
+    assert_eq!(f.count("computations"), 1);
+    assert_eq!(f.count("watch_jobs"), 1000);
+    assert_eq!(f.count("matches"), 1000);
+    f.db().execute("DELETE FROM watch_jobs", []).unwrap();
+    f.db().execute("DELETE FROM computations", []).unwrap();
+    f.db()
+        .execute("UPDATE jobs SET state='pending'", [])
+        .unwrap();
+    let output = f.run();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=0"));
+    assert_eq!(f.count("watch_jobs"), 1000);
+}
+
+#[test]
+fn new_branch_compares_against_explicit_frozen_base() {
+    let f = Fixture::new(true);
+    let text = std::fs::read_to_string(&f.config).unwrap().replace(
+        "[defaults]",
+        "[defaults]\nnew_branch_mode='compare'\nbase_remote='origin'\nbase_branch='main'",
+    );
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    git(&f.work, &["switch", "-qc", "feature"]);
+    std::fs::write(
+        f.work.join("test.c"),
+        BEFORE.replace("value > 0", "value >= 4"),
+    )
+    .unwrap();
+    git(&f.work, &["commit", "-qam", "Feature change"]);
+    git(&f.work, &["push", "-q", "origin", "feature"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert_eq!(event.kind, "branch_created");
+    assert_eq!(event.comparison_base.unwrap().branch, "main");
+    assert!(!event.files.is_empty());
+    assert!(body.contains("explicit base origin/main"));
+    assert!(!f.report().contains("PRIVATE_NEIGHBOR"));
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace("base_remote='origin'\n", "");
+    std::fs::write(&f.config, text).unwrap();
+    assert!(Config::load(&f.config).is_err());
+}
+#[test]
+fn octopus_merge_retains_side_commits_first_parent_patch_and_aggregate() {
+    let f = Fixture::new(false);
+    f.ok();
+    let base = git(&f.work, &["rev-parse", "HEAD"]);
+    for (branch, path) in [("side_one", "one.c"), ("side_two", "two.c")] {
+        git(&f.work, &["switch", "-qc", branch, &base]);
+        std::fs::write(f.work.join(path), format!("int {branch}(){{return 1;}}\n")).unwrap();
+        git(&f.work, &["add", "."]);
+        git(&f.work, &["commit", "-qm", branch]);
+    }
+    git(&f.work, &["switch", "-q", "main"]);
+    git(
+        &f.work,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "Octopus integration",
+            "side_one",
+            "side_two",
+        ],
+    );
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert_eq!(event.commits.len(), 3);
+    assert_eq!(
+        event
+            .commits
+            .iter()
+            .find(|c| c.subject == "Octopus integration")
+            .unwrap()
+            .files
+            .len(),
+        2
+    );
+    assert_eq!(event.files.len(), 2);
+}
+#[test]
+fn cpp_custom_rules_preserve_overload_selection_and_distinguish_missing_objects() {
+    let f = Fixture::new(true);
+    let path = f.work.join("overload.cpp");
+    let before="int target(int x) {\n return x;\n}\ndouble target(double x) {\n return x;\n}\nint PRIVATE_NEIGHBOR(){return 900;}\n";
+    std::fs::write(&path, before).unwrap();
+    std::fs::write(f.work.join(".gitattributes"), "*.cpp diff=selected\n").unwrap();
+    git(&f.work, &["add", "."]);
+    git(&f.work, &["commit", "-qm", "C++ fixture"]);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[execution]",
+            "[execution]\ndiff_drivers={selected='^int [a-zA-Z_][a-zA-Z_0-9]*.*$'}",
+        )
+        .replace("path = 'test.c'", "path = 'overload.cpp'");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    std::fs::write(&path, before.replacen("return x;", "return x+1;", 1)).unwrap();
+    git(&f.work, &["commit", "-qam", "Selected overload"]);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let selected = String::from_utf8(
+        STANDARD
+            .decode(&event.commits[0].files[0].new_bytes)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(selected.starts_with("int target"));
+    assert!(selected.contains("x+1"));
+    assert!(!selected.contains("PRIVATE_NEIGHBOR"));
+    let cfg = Config::load(&f.config).unwrap();
+    let repository = Git {
+        path: repository_path(&cfg.storage.repositories_dir, "project"),
+        execution: cfg.execution,
+        limits: cfg.limits,
+        shutdown: Shutdown::default(),
+    };
+    assert!(repository
+        .tree_blob(&"0".repeat(40), "overload.cpp")
+        .is_err());
+    assert!(repository
+        .tree_blob(event.new.as_deref().unwrap(), "absent.cpp")
+        .unwrap()
+        .is_none());
+}
+#[cfg(unix)]
+fn wait_for_shutdown(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if start.elapsed().as_secs() > 3 {
+            child.kill().unwrap();
+            panic!("shutdown deadline exceeded");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+#[cfg(unix)]
+fn stalled_analysis(f: &Fixture, persistent: bool) -> (std::process::Child, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = f.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let actual = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let actual = String::from_utf8(actual.stdout).unwrap();
+    let marker = f.root.join("analysis-started");
+    let wrapper = bin.join("git");
+    std::fs::write(&wrapper,format!("#!/bin/sh\ncase \" $* \" in *' show '*) if mkdir '{}' 2>/dev/null; then sleep 30; fi;; esac\nexec '{}' \"$@\"\n",marker.display(),actual.trim())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(BIN);
+    command.args(["--config", f.config.to_str().unwrap(), "run", "--force"]);
+    if !persistent {
+        command.arg("--once");
+    }
+    let mut child = command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while !marker.exists() {
+        if start.elapsed().as_secs() > 15 {
+            child.kill().unwrap();
+            panic!("analysis did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (child, marker)
+}
+#[test]
+#[cfg(unix)]
+fn analysis_signal_preserves_frozen_configuration_and_pending_lease() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 5"),
+        "Interrupted analysis",
+    );
+    let (mut child, _) = stalled_analysis(&f, false);
+    let original = std::fs::read(&f.config).unwrap();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGHUP);
+    }
+    std::fs::write(&f.config, "invalid changed TOML").unwrap();
+    wait_for_shutdown(&mut child);
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT count(*) FROM computations WHERE state='running'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db()
+            .query_row("SELECT count(*) FROM jobs WHERE state='pending'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    std::fs::write(&f.config, original).unwrap();
+    f.ok();
+    assert_eq!(f.count("matches"), 1);
+}
+#[test]
+#[cfg(unix)]
+fn daemon_fetch_progresses_while_previous_analysis_is_stalled() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 10"),
+        "First transition",
+    );
+    let (mut child, _) = stalled_analysis(&f, true);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 20"),
+        "Second transition",
+    );
+    let start = std::time::Instant::now();
+    while f.count("events") < 2 {
+        if start.elapsed().as_secs() > 7 {
+            child.kill().unwrap();
+            panic!("fetch clock blocked behind analysis");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    wait_for_shutdown(&mut child);
+    f.ok();
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE state IN ('pending','running')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+#[test]
+#[cfg(unix)]
+fn smtp_signal_preserves_uncertain_message() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 15"),
+        "Interrupted SMTP",
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mail = f.root.join("mail.toml");
+    std::fs::write(&mail,format!("version=1\n[smtp]\nhost='127.0.0.1'\nport={port}\nsecurity='none'\nfrom='test@example.invalid'\ntimeout='30s'\n")).unwrap();
+    let mut child = Command::new(BIN)
+        .args([
+            "--config",
+            f.config.to_str().unwrap(),
+            "--mail-config",
+            mail.to_str().unwrap(),
+            "run",
+            "--once",
+            "--force",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let _socket = loop {
+        if let Ok((socket, _)) = listener.accept() {
+            break socket;
+        }
+        if start.elapsed().as_secs() > 15 {
+            child.kill().unwrap();
+            panic!("SMTP did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    wait_for_shutdown(&mut child);
+    let (state, mime): (String, Vec<u8>) = f
+        .db()
+        .query_row("SELECT state,mime FROM deliveries", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "uncertain");
+    assert!(!mime.is_empty());
+}
+
+fn comparison_config(f: &Fixture, poll: &str) -> Config {
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[defaults]",
+            "[defaults]\nnew_branch_mode='compare'\nbase_remote='origin'\nbase_branch='main'",
+        )
+        .replace("poll_every='1s'", &format!("poll_every='{poll}'"));
+    std::fs::write(&f.config, text).unwrap();
+    let mut cfg = Config::load(&f.config).unwrap();
+    cfg.freeze().unwrap();
+    cfg
+}
+
+#[test]
+fn comparison_base_respects_poll_interval_and_inactive_watches() {
+    let f = Fixture::new(false);
+    let mut cfg = comparison_config(&f, "1h");
+    f.ok();
+    // Any network access would now fail, including the comparison-base fetch.
+    std::fs::rename(&f.remote, f.root.join("offline.git")).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let stop = Shutdown::default();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    cfg.watches.clear();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 0)
+    );
+}
+
+#[test]
+fn comparison_base_failure_backs_off_and_recovers_without_losing_observations() {
+    let f = Fixture::new(false);
+    let cfg = comparison_config(&f, "1s");
+    // Failure before the first snapshot must also establish a retry clock.
+    let offline = f.root.join("offline.git");
+    std::fs::rename(&f.remote, &offline).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let stop = Shutdown::default();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 1)
+    );
+    assert_eq!(f.count("attempts"), 0);
+    assert_eq!(f.count("snapshots"), 0);
+    let key: String = store
+        .db
+        .query_row("SELECT key FROM remote_status", [], |r| r.get(0))
+        .unwrap();
+    assert!(store.next_poll(&key).unwrap() > git_monitor::now());
+    // Restore access, but do not bypass backoff: no baseline may appear yet.
+    std::fs::rename(&offline, &f.remote).unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    assert_eq!(f.count("snapshots"), 0);
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    assert_eq!(f.count("snapshots"), 1);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 9"),
+        "Pending transition",
+    );
+    store
+        .db
+        .execute("UPDATE snapshots SET checked=0", [])
+        .unwrap();
+    std::fs::rename(&f.remote, &offline).unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 1)
+    );
+    assert_eq!(f.count("events"), 0);
+    std::fs::rename(&offline, &f.remote).unwrap();
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (1, 0)
+    );
+    assert_eq!(f.count("events"), 1);
+    let failures: i64 = store
+        .db
+        .query_row("SELECT failures FROM remote_status", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(failures, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn comparison_base_failure_does_not_stop_daemon() {
+    let f = Fixture::new(false);
+    comparison_config(&f, "1s");
+    f.ok();
+    std::fs::rename(&f.remote, f.root.join("offline.git")).unwrap();
+    let mut child = Command::new(BIN)
+        .args(["--config", f.config.to_str().unwrap(), "run", "--force"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon exited on a temporary base failure"
+        );
+        let failures: i64 = f
+            .db()
+            .query_row("SELECT failures FROM remote_status", [], |r| r.get(0))
+            .unwrap();
+        if failures > 0 {
+            break;
+        }
+        if start.elapsed().as_secs() > 10 {
+            child.kill().unwrap();
+            panic!("base failure was not recorded");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    wait_for_shutdown(&mut child);
 }

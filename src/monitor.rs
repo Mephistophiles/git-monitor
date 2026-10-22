@@ -5,8 +5,7 @@ use crate::{
     mail::{self, MailConfig},
     model::{CommitView, EventView, FileDiff, Report},
     process::{self, Shutdown},
-    render,
-    store::{source_key, Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
+    store::{Analysis, Attempt, FetchPlan, NarrowObservation, Store, Task},
 };
 use anyhow::{ensure, Context, Result};
 use fs2::FileExt;
@@ -17,6 +16,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -137,6 +137,11 @@ fn selected(
     commit_patch: bool,
 ) -> Result<(Vec<FileDiff>, Vec<String>)> {
     let w = &task.watch;
+    let profile = if task.execution.analysis_profile.git.is_empty() {
+        crate::profile::AnalysisProfile::freeze(&task.execution.diff_drivers)?
+    } else {
+        task.execution.analysis_profile.clone()
+    };
     let mut files = vec![];
     let mut notes = vec![];
     if let Some(f) = &w.function {
@@ -156,22 +161,42 @@ fn selected(
             ));
         }
         if a.as_ref().map(|s| &s.bytes) != b.as_ref().map(|s| &s.bytes) {
+            let patch = git.snippet_patch(
+                a.as_ref().map_or(&[], |s| s.bytes.as_slice()),
+                b.as_ref().map_or(&[], |s| s.bytes.as_slice()),
+                task.diff.context_lines,
+            )?;
             let mut fd = diff::build(
                 &f.path,
                 a.as_ref().map_or(&[], |s| s.bytes.as_slice()),
                 b.as_ref().map_or(&[], |s| s.bytes.as_slice()),
                 a.as_ref().map_or(1, |s| s.start),
                 b.as_ref().map_or(1, |s| s.start),
-                None,
+                Some(&patch),
                 &task.diff,
                 &task.limits,
             );
+            fd.canonical_patch = None;
             fd.kind = match (a.is_some(), b.is_some()) {
                 (false, true) => "function_appeared",
                 (true, false) => "function_disappeared",
                 _ => "function_modified",
             }
             .into();
+            if let Some(document) = &mut fd.document {
+                document.analysis_profile = Some(profile.clone());
+                document.old.blob = a.as_ref().map(|s| s.oid.clone());
+                document.new.blob = b.as_ref().map(|s| s.oid.clone());
+                let old_offset = a.as_ref().map_or(0, |s| s.offset);
+                let new_offset = b.as_ref().map_or(0, |s| s.offset);
+                document.old.original_range.start += old_offset;
+                document.old.original_range.end += old_offset;
+                document.new.original_range.start += new_offset;
+                document.new.original_range.end += new_offset;
+                document
+                    .quality
+                    .push("scoped_function_diff_not_a_whole_file_patch".into());
+            }
             fd.note = format!(
                 "{} · scoped function diff · selector {}",
                 fd.note, f.expression
@@ -179,6 +204,13 @@ fn selected(
             files.push(fd);
         }
     } else {
+        let oids = changes
+            .iter()
+            .filter(|c| w.path_matches(&c.path) && c.old_mode != "160000" && c.new_mode != "160000")
+            .flat_map(|c| c.old_blob.iter().chain(&c.new_blob))
+            .cloned()
+            .collect();
+        git.prefetch_blobs(&oids)?;
         for change in changes.iter().filter(|f| {
             w.path_matches(&f.path)
                 && task
@@ -211,7 +243,7 @@ fn selected(
                     return Ok(f);
                 }
                 let patch = if commit_patch {
-                    git.show_patch(new, &change.path)?
+                    git.show_patch(new, &change.path, task.diff.context_lines)?
                 } else {
                     git.raw(&[
                         "diff",
@@ -220,7 +252,7 @@ fn selected(
                         "--no-ext-diff",
                         "--no-textconv",
                         "--diff-algorithm=histogram",
-                        "--unified=3",
+                        &format!("--unified={}", task.diff.context_lines),
                         old.context("aggregate diff needs an old revision")?,
                         new,
                         "--",
@@ -241,6 +273,13 @@ fn selected(
                     f.kind = "mode_changed".into();
                     f.note = format!("File mode {} → {}", change.old_mode, change.new_mode);
                 }
+                if let Some(document) = &mut f.document {
+                    document.analysis_profile = Some(profile.clone());
+                    document.old.blob = change.old_blob.clone();
+                    document.new.blob = change.new_blob.clone();
+                    document.old.mode = change.old_mode.clone();
+                    document.new.mode = change.new_mode.clone();
+                }
                 Ok(f)
             };
             match make() {
@@ -256,6 +295,11 @@ fn selected(
 }
 
 pub fn analyze(task: &Task) -> Result<Analysis> {
+    crate::structural::set_cache(
+        task.execution
+            .share_computations
+            .then(|| task.path.join("git-monitor-syntax-cache")),
+    );
     let git = Git {
         path: task.path.clone(),
         execution: task.execution.clone(),
@@ -263,7 +307,21 @@ pub fn analyze(task: &Task) -> Result<Analysis> {
         shutdown: Shutdown::default(),
     };
     let mut result = Analysis::default();
-    if task.event.kind == "branch_created" || task.event.kind == "branch_deleted" {
+    if task.event.kind == "branch_created" {
+        if let Some(base) = &task.event.comparison_base {
+            let new = task.event.new.as_deref().context("missing new OID")?;
+            let changes = git.changed(Some(&base.oid), new)?;
+            let (files, notes) = selected(&git, task, Some(&base.oid), new, &changes, false)?;
+            result.files = files;
+            result.notes = notes;
+            result.notes.push(format!(
+                "Comparison against explicit base {}/{} @ {}; branch origin is not inferred",
+                base.remote, base.branch, base.oid
+            ));
+        }
+        return Ok(result);
+    }
+    if task.event.kind == "branch_deleted" {
         return Ok(result);
     }
     let old = task.event.old.as_deref().context("missing old OID")?;
@@ -286,13 +344,18 @@ pub fn analyze(task: &Task) -> Result<Analysis> {
     }
     if task.event.kind == "history_rewritten" {
         result.outgoing = git.commits(new, old)?;
+    }
+    {
         let changes = git.changed(Some(old), new)?;
         let (files, notes) = selected(&git, task, Some(old), new, &changes, false)?;
         result.files = files;
         result.notes.extend(notes);
-        result.notes.push(
-            "History rewritten: aggregate old → new comparison; commit history is a DAG.".into(),
-        );
+        if task.event.kind == "history_rewritten" {
+            result.notes.push(
+                "History rewritten: aggregate old → new comparison; commit history is a DAG."
+                    .into(),
+            );
+        }
     }
     Ok(result)
 }
@@ -339,6 +402,14 @@ pub fn fetch_attempt(
     attempt: &mut Attempt,
     git: &Git,
 ) -> Result<BTreeMap<String, String>> {
+    fetch_attempt_journal(id, attempt, git, |a| store.update_attempt(id, a))
+}
+fn fetch_attempt_journal(
+    id: i64,
+    attempt: &mut Attempt,
+    git: &Git,
+    journal: impl Fn(&Attempt) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
     if matches!(attempt.plan, FetchPlan::All) {
         git.fetch(&attempt.remote, !attempt.initialized)?;
         return git.refs(&attempt.remote);
@@ -362,7 +433,7 @@ pub fn fetch_attempt(
                 previous_marker: previous_marker.clone(),
             }),
         };
-        store.update_attempt(id, attempt)?;
+        journal(attempt)?;
         match git.download_selected(&attempt.remote, &staging, &desired, !attempt.initialized) {
             Ok(true) => {
                 git.publish_selected(
@@ -390,185 +461,349 @@ pub fn collect(
     shutdown: &Shutdown,
     force: bool,
 ) -> Result<(usize, usize)> {
-    let mut events = recover(store, shutdown)?;
-    let mut failures = 0;
-    for (repository, r) in &cfg.repositories {
-        if shutdown.requested() {
-            break;
-        }
-        let git = Git {
-            path: repository_path(&cfg.storage.repositories_dir, repository),
-            execution: cfg.execution.clone(),
-            limits: cfg.limits.clone(),
-            shutdown: shutdown.clone(),
-        };
-        git.init()?;
-        for (remote, source) in &r.remotes {
+    crate::persistence::scope(store, |shared| collect_actor(cfg, shared, shutdown, force))
+}
+fn collect_actor(
+    cfg: &Config,
+    shared: &crate::persistence::Actor,
+    shutdown: &Shutdown,
+    force: bool,
+) -> Result<(usize, usize)> {
+    let stop = shutdown.clone();
+    let recovered = shared.call(move |s| recover(s, &stop))?;
+    let frozen = cfg.clone();
+    shared.call(move |s| s.retire_disabled_sources(&frozen))?;
+    let hosts = crate::scheduler::Hosts::new(cfg.execution.max_fetches_per_host);
+    let results = crate::scheduler::map(
+        cfg.repositories.iter().collect(),
+        cfg.execution.max_fetches,
+        |(repository, r)| -> Result<(usize, usize)> {
+            let (mut events, mut failures) = (0, 0);
             if shutdown.requested() {
-                break;
+                return Ok((0, 0));
             }
-            let watches: Vec<_> = cfg
-                .watches
-                .iter()
-                .filter(|w| w.repository == *repository && w.remotes.contains(remote))
-                .cloned()
-                .collect();
-            if watches.is_empty() {
-                continue;
-            }
-            let key = source_key(repository, remote, &source.url);
-            let snapshot = store.snapshot(&key)?;
-            let interval = duration(
-                source
-                    .poll_every
-                    .as_deref()
-                    .unwrap_or(&cfg.defaults.poll_every),
-            )?
-            .as_secs();
-            if !force && crate::now() < store.next_poll(&key)? {
-                continue;
-            }
-            if !force
-                && snapshot
-                    .as_ref()
-                    .is_some_and(|(_, _, t)| crate::now().saturating_sub(*t) < interval)
-            {
-                continue;
-            }
-            // Preserve every currently published object before replacing a source URL.
-            let published = git.refs(remote)?;
-            for oid in published.values() {
-                git.pin(oid)?;
-            }
-            let plan = FetchPlan::for_watches(&watches);
-            let mut attempt = Attempt {
-                key: key.clone(),
-                repository: repository.clone(),
-                remote: remote.clone(),
-                path: git.path.clone(),
-                old: snapshot.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
-                published,
-                initialized: snapshot.is_some(),
-                previous: snapshot.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
-                watches,
+            let git = Git {
+                path: repository_path(&cfg.storage.repositories_dir, repository),
                 execution: cfg.execution.clone(),
                 limits: cfg.limits.clone(),
-                diff: cfg.diff.clone(),
-                plan,
+                shutdown: shutdown.clone(),
             };
-            for oid in attempt.old.values() {
-                git.pin(oid)?;
-            }
-            git.configure_remote(remote, &source.url)?;
-            let id = store.begin(&attempt)?;
-            match fetch_attempt(store, id, &mut attempt, &git) {
-                Ok(refs) => {
-                    events += store.finish(id, &attempt, refs, &git)?;
-                    eprintln!("checked {repository}/{remote}");
+            git.init_format(&r.object_format)?;
+            // Fetch the shared base lazily, only when an active source is due.
+            // A failed base is retried on the next eligible pass, not per remote.
+            let mut comparison_base = None;
+            let mut base_failed = false;
+            for (remote, source) in &r.remotes {
+                if shutdown.requested() {
+                    break;
                 }
-                Err(_) => {
-                    if shutdown.requested() {
-                        // Keep the attempt: deadline expiry must not start fresh Git work.
-                        break;
+                let watches: Vec<_> = cfg
+                    .watches
+                    .iter()
+                    .filter(|w| w.repository == *repository && w.remotes.contains(remote))
+                    .cloned()
+                    .collect();
+                if watches.is_empty() {
+                    continue;
+                }
+                let key = shared.activate_source(
+                    repository,
+                    remote,
+                    &crate::store::source_identity(repository, remote, source),
+                )?;
+                let snapshot = shared.snapshot(&key)?;
+                let interval = duration(
+                    source
+                        .poll_every
+                        .as_deref()
+                        .unwrap_or(&cfg.defaults.poll_every),
+                )?
+                .as_secs();
+                let interval = crate::scheduler::poll_interval(&key, interval);
+                if !force && crate::now() < shared.next_poll(&key)? {
+                    continue;
+                }
+                if !force
+                    && snapshot
+                        .as_ref()
+                        .is_some_and(|(_, _, t)| crate::now().saturating_sub(*t) < interval)
+                {
+                    continue;
+                }
+                if cfg.defaults.new_branch_mode == "compare" {
+                    let (poll_key, poll_repository, poll_remote) =
+                        (key.clone(), repository.clone(), remote.clone());
+                    shared
+                        .call(move |s| s.begin_poll(&poll_key, &poll_repository, &poll_remote))?;
+                    if comparison_base.is_none() && !base_failed {
+                        let base_remote = cfg
+                            .defaults
+                            .base_remote
+                            .as_deref()
+                            .context("missing base_remote")?;
+                        let branch = cfg
+                            .defaults
+                            .base_branch
+                            .as_deref()
+                            .context("missing base_branch")?;
+                        let base_source = &r.remotes[base_remote];
+                        let Some(_permit) = hosts.acquire(&base_source.url, shutdown) else {
+                            break;
+                        };
+                        git.configure_remote(base_remote, &base_source.url)?;
+                        match git.fetch_base(base_remote, branch) {
+                            Ok(oid) => {
+                                comparison_base = Some(crate::model::ComparisonBase {
+                                    remote: base_remote.into(),
+                                    branch: branch.into(),
+                                    oid,
+                                })
+                            }
+                            Err(_) if shutdown.requested() => break,
+                            Err(_) => base_failed = true,
+                        }
                     }
-                    failures += 1;
-                    recover(store, shutdown)?;
-                    store.fetch_error(&key)?;
-                    eprintln!("fetch failed: {repository}/{remote}; local result reconciled");
+                    if base_failed {
+                        failures += 1;
+                        shared.fetch_error(&key)?;
+                        eprintln!(
+                            "comparison base fetch failed: {repository}/{remote}; retry scheduled"
+                        );
+                        continue;
+                    }
+                }
+                // Preserve every currently published object before replacing a source URL.
+                let published = git.refs(remote)?;
+                for oid in published.values() {
+                    git.pin(oid)?;
+                }
+                let plan = FetchPlan::for_watches(&watches);
+                let mut attempt = Attempt {
+                    key: key.clone(),
+                    repository: repository.clone(),
+                    remote: remote.clone(),
+                    path: git.path.clone(),
+                    old: snapshot.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
+                    published,
+                    initialized: snapshot.is_some(),
+                    previous: snapshot.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
+                    watches,
+                    execution: cfg.execution.clone(),
+                    limits: cfg.limits.clone(),
+                    diff: cfg.diff.clone(),
+                    plan,
+                    comparison_base: comparison_base.clone(),
+                };
+                for oid in attempt.old.values() {
+                    git.pin(oid)?;
+                }
+                git.configure_remote(remote, &source.url)?;
+                let Some(_permit) = hosts.acquire(&source.url, shutdown) else {
+                    break;
+                };
+                let id = shared.begin(&attempt)?;
+                match fetch_attempt_journal(id, &mut attempt, &git, |a| {
+                    shared.update_attempt(id, a)
+                }) {
+                    Ok(refs) => {
+                        events += shared.finish(id, &attempt, refs, &git)?;
+                        eprintln!("checked {repository}/{remote}");
+                    }
+                    Err(_) => {
+                        if shutdown.requested() {
+                            // Keep the attempt: deadline expiry must not start fresh Git work.
+                            break;
+                        }
+                        failures += 1;
+                        shared.fetch_error(&key)?;
+                        eprintln!("fetch failed: {repository}/{remote}; local result reconciled");
+                    }
                 }
             }
+            Ok((events, failures))
+        },
+    );
+    let (mut events, mut failures, mut error) = (recovered, 0, None);
+    for result in results {
+        match result {
+            Ok((e, f)) => {
+                events += e;
+                failures += f;
+            }
+            Err(e) => error = Some(e),
         }
+    }
+    if !shutdown.requested() {
+        let stop = shutdown.clone();
+        events += shared.call(move |s| recover(s, &stop))?;
+    }
+    if let Some(error) = error {
+        return Err(error);
     }
     Ok((events, failures))
 }
 
+pub fn analysis_key(cfg: &Config, task: &Task) -> Result<String> {
+    Ok(crate::hash(serde_json::to_vec(&(
+        if cfg.execution.analysis_profile.git.is_empty() {
+            crate::profile::AnalysisProfile::freeze(&cfg.execution.diff_drivers)?.key()
+        } else {
+            cfg.execution.analysis_profile.key()
+        },
+        &task.event.repository,
+        &task.path,
+        &task.event.old,
+        &task.event.new,
+        &task.event.kind,
+        &task.event.comparison_base,
+        task.watch.selector_key(),
+        task.previous_watch.as_ref().map(Watch::selector_key),
+        &task.diff,
+        &task.limits,
+    ))?))
+}
 pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Result<usize> {
+    crate::persistence::scope(store, |shared| process_jobs_actor(cfg, shared, shutdown))
+}
+fn process_jobs_actor(
+    cfg: &Config,
+    shared: &crate::persistence::Actor,
+    shutdown: &Shutdown,
+) -> Result<usize> {
     let tmp = cfg.storage.state_dir.join("tmp");
     std::fs::create_dir_all(&tmp)?;
-    let mut analyses = 0;
-    for (id, mut task) in store.jobs()? {
+    let frozen = Arc::new(cfg.clone());
+    let mut groups: BTreeMap<String, Vec<(i64, Task)>> = BTreeMap::new();
+    for (id, mut task) in shared.call(|s| s.jobs())? {
         task.execution = cfg.execution.clone();
         task.limits = cfg.limits.clone();
         task.diff = cfg.diff.clone();
-        if shutdown.requested() {
-            break;
+        let mut key = analysis_key(cfg, &task)?;
+        if !cfg.execution.share_computations {
+            key = crate::hash(format!("{key}:{id}"));
         }
-        let key = crate::hash(serde_json::to_vec(&(
-            &task.event.repository,
-            &task.path,
-            &task.event.old,
-            &task.event.new,
-            &task.event.kind,
-            task.watch.selector_key(),
-            task.previous_watch.as_ref().map(Watch::selector_key),
-            &task.diff,
-            &task.limits,
-        ))?);
-        if let Some(result) = store.cache(&key)? {
-            store.finish_job(id, &task, &key, &result, None, cfg)?;
-            continue;
-        }
-        store
-            .db
-            .execute("UPDATE jobs SET state='running' WHERE id=?", [id])?;
-        let input = tmp.join(format!("job-{id}.json"));
-        let output = tmp.join(format!("result-{id}.json"));
-        crate::atomic_write(&input, &serde_json::to_vec(&task)?)?;
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("worker")
-            .arg("--input")
-            .arg(&input)
-            .arg("--output")
-            .arg(&output);
-        let run = process::run(
-            &mut cmd,
-            duration(&cfg.limits.analysis_timeout)?,
-            65536,
-            shutdown,
-            duration(&cfg.execution.shutdown_grace)?,
-            Some(cfg.limits.max_worker_address_space_bytes),
-        );
-        analyses += 1;
-        let result = run.and_then(|o| {
-            ensure!(
-                o.code == 0,
-                "analysis worker failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let size = std::fs::metadata(&output)?.len();
-            ensure!(
-                size <= cfg.limits.max_job_output_bytes as u64,
-                "analysis output budget exceeded"
-            );
-            Ok(serde_json::from_slice::<Analysis>(&std::fs::read(
-                &output,
-            )?)?)
-        });
-        match result {
-            Ok(result) => store.finish_job(id, &task, &key, &result, None, cfg)?,
-            Err(e) => {
-                if shutdown.requested() {
-                    store
-                        .db
-                        .execute("UPDATE jobs SET state='pending' WHERE id=?", [id])?;
-                } else {
-                    let error = e.to_string();
-                    let result = Analysis {
-                        notes: vec![format!("analysis_failed: {error}")],
-                        ..Default::default()
-                    };
-                    store.finish_job(id, &task, &key, &result, Some(&error), cfg)?;
-                    eprintln!("analysis job {id} failed");
+        groups.entry(key).or_default().push((id, task));
+    }
+    let results = crate::scheduler::map(
+        groups.into_iter().collect(),
+        cfg.execution.max_analyses,
+        |(key, bindings)| -> Result<usize> {
+            if shutdown.requested() {
+                return Ok(0);
+            }
+            let task = &bindings[0].1;
+            if cfg.execution.share_computations {
+                let (key, bindings, cfg) = (key.clone(), bindings.clone(), frozen.clone());
+                if shared.call(move |s| {
+                    if let Some(result) = s.cache(&key)? {
+                        for (id, task) in &bindings {
+                            s.finish_job(*id, task, &key, &result, None, &cfg)?;
+                        }
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })? {
+                    crate::metrics::update(|s| s.analysis_cache_hits += 1);
+                    return Ok(0);
                 }
             }
-        }
-        let _ = std::fs::remove_file(input);
-        let _ = std::fs::remove_file(output);
+            let timeout = duration(&cfg.limits.analysis_timeout)?;
+            let token =
+                shared.claim_computation(&key, &bindings, timeout.as_secs().saturating_add(60))?;
+            let input = tmp.join(format!("job-{token}.json"));
+            let output = tmp.join(format!("result-{token}.json"));
+            crate::atomic_write(&input, &serde_json::to_vec(task)?)?;
+            let mut command = Command::new(process::worker_executable()?);
+            command
+                .arg("worker")
+                .arg("--input")
+                .arg(&input)
+                .arg("--output")
+                .arg(&output);
+            let result = process::run(
+                &mut command,
+                timeout,
+                65536,
+                shutdown,
+                duration(&cfg.execution.shutdown_grace)?,
+                Some(cfg.limits.max_worker_address_space_bytes),
+            )
+            .and_then(|out| {
+                ensure!(
+                    out.code == 0,
+                    "analysis worker failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                ensure!(
+                    std::fs::metadata(&output)?.len() <= cfg.limits.max_job_output_bytes as u64,
+                    "analysis output budget exceeded"
+                );
+                let result: Analysis = serde_json::from_slice(&std::fs::read(&output)?)?;
+                for file in result
+                    .files
+                    .iter()
+                    .chain(result.commits.iter().flat_map(|c| &c.files))
+                {
+                    file.validate()?;
+                }
+                Ok(result)
+            });
+            let cfg = frozen.clone();
+            let interrupted = shutdown.requested();
+            shared.call(move |s| {
+                if s.owns_computation(&key, &token)? {
+                    match result {
+                        Ok(result) => {
+                            s.record_metrics("analysis-worker", &result.counters)?;
+                            for (id, task) in &bindings {
+                                s.finish_job(*id, task, &key, &result, None, &cfg)?;
+                            }
+                            s.release_computation(&key, &token, Some(&result))?;
+                        }
+                        Err(error) => {
+                            if interrupted {
+                                for (id, _) in &bindings {
+                                    s.db.execute(
+                                        "UPDATE jobs SET state='pending' WHERE id=?",
+                                        [id],
+                                    )?;
+                                }
+                            } else {
+                                let error = error.to_string();
+                                let result = Analysis {
+                                    notes: vec![format!("analysis_failed: {error}")],
+                                    ..Default::default()
+                                };
+                                for (id, task) in &bindings {
+                                    s.finish_job(*id, task, &key, &result, Some(&error), &cfg)?;
+                                }
+                            }
+                            s.release_computation(&key, &token, None)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            let _ = std::fs::remove_file(input);
+            let _ = std::fs::remove_file(output);
+            Ok(1)
+        },
+    );
+    let mut count = 0;
+    for result in results {
+        count += result?;
     }
-    Ok(analyses)
+    crate::metrics::update(|s| s.analyses += count as u64);
+    Ok(count)
 }
 
-fn allowed(cfg: &Config, watch: &Watch, event: &EventView, key: &str) -> Option<Watch> {
+fn allowed(
+    cfg: &Config,
+    store: &Store,
+    watch: &Watch,
+    event: &EventView,
+    key: &str,
+) -> Option<Watch> {
     let current = cfg.watches.iter().find(|w| {
         w.id == watch.id
             && w.repository == event.repository
@@ -588,7 +823,16 @@ fn allowed(cfg: &Config, watch: &Watch, event: &EventView, key: &str) -> Option<
         .get(&event.repository)?
         .remotes
         .get(&event.remote)?;
-    (source_key(&event.repository, &event.remote, &source.url) == key).then(|| current.clone())
+    (store
+        .active_source(
+            &event.repository,
+            &event.remote,
+            &crate::store::source_identity(&event.repository, &event.remote, source),
+        )
+        .ok()?
+        .as_str()
+        == key)
+        .then(|| current.clone())
 }
 
 pub fn report(
@@ -606,7 +850,7 @@ pub fn report(
         pending_only,
         cfg.limits.max_job_output_bytes,
         |m| {
-            if let Some(w) = allowed(cfg, &m.watch, &m.event, &m.key)
+            if let Some(w) = allowed(cfg, store, &m.watch, &m.event, &m.key)
                 .filter(|w| w.recipients.iter().any(|r| r == recipient))
             {
                 scopes.insert(m.id, w);
@@ -685,6 +929,17 @@ pub fn report(
 pub fn outputs(
     cfg: &Config,
     store: &mut Store,
+    mail: Option<&MailConfig>,
+    shutdown: &Shutdown,
+    output: Option<&Path>,
+) -> Result<usize> {
+    crate::persistence::scope(store, |actor| {
+        outputs_actor(cfg, actor, mail, shutdown, output)
+    })
+}
+fn outputs_actor(
+    cfg: &Config,
+    actor: &crate::persistence::Actor,
     mail_config: Option<&MailConfig>,
     shutdown: &Shutdown,
     output: Option<&Path>,
@@ -693,141 +948,227 @@ pub fn outputs(
     std::fs::create_dir_all(&artifacts)?;
     let mut queued = 0;
     for (recipient, r) in &cfg.recipients {
-        if let Some(mail) = mail_config {
-            let revision = mail::revision(cfg, recipient, mail);
-            let stale: Vec<String> = store.db.prepare("SELECT DISTINCT digest FROM deliveries WHERE recipient=? AND revision<>? AND state NOT IN ('sent','revoked')")?.query_map(params![recipient, revision], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-            for digest in stale {
-                let tx = store.db.transaction()?;
-                tx.execute(
-                    "UPDATE deliveries SET state='revoked' WHERE digest=? AND state<>'sent'",
-                    [&digest],
-                )?;
-                tx.execute("UPDATE matches SET digest=NULL WHERE digest=?", [&digest])?;
-                tx.execute(
-                    "UPDATE clocks SET last_digest=0 WHERE recipient=?",
-                    [recipient],
-                )?;
-                tx.commit()?;
-            }
+        if shutdown.requested() {
+            break;
         }
-        let (pending, ids) = report(cfg, store, recipient, mail_config.is_some())?;
-        let html = if pending.events.is_empty() && mail_config.is_some() {
-            render::html(&report(cfg, store, recipient, false)?.0, &cfg.diff)
-        } else {
-            render::html(&pending, &cfg.diff)
-        };
-        crate::atomic_write(
-            &artifacts.join(format!("{recipient}-latest.html")),
-            html.as_bytes(),
-        )?;
-        if let Some(dir) = output {
-            crate::atomic_write(&dir.join(format!("{recipient}.html")), html.as_bytes())?;
-        }
-        let Some(mail) = mail_config else {
-            continue;
-        };
-        let revision = mail::revision(cfg, recipient, mail);
+        let revision = mail_config.map(|m| mail::revision(cfg, recipient, m));
+        let (configuration, name, wanted) = (cfg.clone(), recipient.clone(), revision.clone());
+        let(pending,ids,preview,clock)=actor.call(move|store|{let has_mail=wanted.is_some();if let Some(revision)=wanted{
+   let stale:Vec<String>=store.db.prepare("SELECT DISTINCT digest FROM deliveries WHERE recipient=? AND revision<>? AND state NOT IN ('sent','revoked')")?.query_map(params![name,revision],|r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
+   for digest in stale{let tx=store.db.transaction()?;tx.execute("UPDATE deliveries SET state='revoked' WHERE digest=? AND state<>'sent'",[&digest])?;tx.execute("UPDATE matches SET digest=NULL WHERE digest=?",[&digest])?;tx.execute("UPDATE clocks SET last_digest=0 WHERE recipient=?",[&name])?;tx.commit()?;}
+  }let(pending,ids)=report(&configuration,store,&name,has_mail)?;let preview=if pending.events.is_empty()&&has_mail{report(&configuration,store,&name,false)?.0}else{pending.clone()};Ok((pending,ids,preview,store.clock(&name)?))})?;
         let interval = duration(
             r.digest_every
                 .as_deref()
                 .unwrap_or(&cfg.defaults.digest_every),
         )?
         .as_secs();
-        let last = store.clock(recipient)?;
-        if pending.events.is_empty()
-            || crate::now().saturating_sub(last) < interval
-            || shutdown.requested()
-        {
+        let ready = revision.is_some()
+            && !pending.events.is_empty()
+            && crate::now().saturating_sub(clock) >= interval
+            && !shutdown.requested();
+        let prepared = match crate::prepare::bounded(
+            cfg,
+            &preview,
+            if ready { Some(r) } else { None },
+            mail_config.map(|m| m.smtp.from.as_str()),
+            shutdown,
+        ) {
+            Ok(result) => result,
+            Err(_) if shutdown.requested() => break,
+            Err(error) => return Err(error),
+        };
+        actor.record_metrics("report-worker", &prepared.counters)?;
+        crate::atomic_write(
+            &artifacts.join(format!("{recipient}-latest.html")),
+            prepared.html.as_bytes(),
+        )?;
+        if let Some(output) = output {
+            crate::atomic_write(
+                &output.join(format!("{recipient}.html")),
+                prepared.html.as_bytes(),
+            )?;
+        }
+        if !ready {
             continue;
         }
-        let parts = mail::package(&pending, r, mail, cfg)?;
-        let tx = store.db.transaction()?;
+        let revision = revision.unwrap();
         let digest = crate::hash(serde_json::to_vec(&(
             &revision,
             &ids,
             pending.generated_at,
         ))?);
-        for (index, (id, mime, html)) in parts.into_iter().enumerate() {
-            let artifact = artifacts.join(format!("{digest}-{}.html", index + 1));
-            crate::atomic_write(&artifact, html.as_bytes())?;
-            tx.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,digest=excluded.digest,mime=excluded.mime,state='pending' WHERE deliveries.state='revoked'",params![id,recipient,revision,digest,mime])?;
-            queued += 1;
-        }
-        for id in ids {
-            tx.execute(
-                "UPDATE matches SET digest=? WHERE id=?",
-                params![digest, id],
+        let mut messages = vec![];
+        for (index, (id, mime, html)) in prepared.parts.into_iter().enumerate() {
+            crate::atomic_write(
+                &artifacts.join(format!("{digest}-{}.html", index + 1)),
+                html.as_bytes(),
             )?;
+            messages.push((id, mime));
         }
-        tx.execute(
-            "UPDATE clocks SET last_digest=? WHERE recipient=?",
-            params![crate::now(), recipient],
-        )?;
-        tx.commit()?;
+        queued += messages.len();
+        let recipient = recipient.clone();
+        actor.call(move|store|{let tx=store.db.transaction()?;tx.execute("INSERT OR IGNORE INTO delivery_times VALUES(?,?)",params![digest,crate::now()])?;for(id,mime)in messages{tx.execute("INSERT INTO deliveries(id,recipient,revision,digest,mime) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,digest=excluded.digest,mime=excluded.mime,state='pending' WHERE deliveries.state='revoked'",params![id,recipient,revision,digest,mime])?;}for id in ids{tx.execute("UPDATE matches SET digest=? WHERE id=?",params![digest,id])?;}tx.execute("UPDATE clocks SET last_digest=? WHERE recipient=?",params![crate::now(),recipient])?;tx.commit()?;Ok(())})?;
     }
     Ok(queued)
 }
-
 pub fn send(
     cfg: &Config,
-    store: &Store,
+    store: &mut Store,
     mail: &MailConfig,
     shutdown: &Shutdown,
     force: bool,
 ) -> Result<usize> {
-    let rows: Vec<(String,String,String)> = store.db.prepare("SELECT id,recipient,revision FROM deliveries WHERE state IN ('pending','uncertain') AND (? OR next_attempt<=?) ORDER BY rowid LIMIT 100")?.query_map(params![force,crate::now()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<_,_>>()?;
+    crate::persistence::scope(store, |actor| send_actor(cfg, actor, mail, shutdown, force))
+}
+fn send_actor(
+    cfg: &Config,
+    actor: &crate::persistence::Actor,
+    mail: &MailConfig,
+    shutdown: &Shutdown,
+    force: bool,
+) -> Result<usize> {
+    let rows:Vec<(String,String,String)>=actor.call(move|store|Ok(store.db.prepare("SELECT id,recipient,revision FROM deliveries WHERE state IN ('pending','uncertain') AND (? OR next_attempt<=?) ORDER BY rowid LIMIT 100")?.query_map(params![force,crate::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<_,_>>()?))?;
     let mut sent = 0;
     for (id, recipient, revision) in rows {
         if shutdown.requested() {
             break;
         }
         let Some(r) = cfg.recipients.get(&recipient) else {
-            store
-                .db
-                .execute("UPDATE deliveries SET state='revoked' WHERE id=?", [&id])?;
+            actor.call(move |store| {
+                store
+                    .db
+                    .execute("UPDATE deliveries SET state='revoked' WHERE id=?", [id])?;
+                Ok(())
+            })?;
             continue;
         };
         if mail::revision(cfg, &recipient, mail) != revision {
             continue;
         }
-        let mime: Vec<u8> =
-            store
+        let key = id.clone();
+        let mime: Vec<u8> = actor.call(move |store| {
+            Ok(store
                 .db
-                .query_row("SELECT mime FROM deliveries WHERE id=?", [&id], |r| {
+                .query_row("SELECT mime FROM deliveries WHERE id=?", [key], |r| {
                     r.get(0)
-                })?;
+                })?)
+        })?;
         let message = cfg.storage.state_dir.join("tmp/smtp-message.eml");
         crate::atomic_write(&message, &mime)?;
-        store.db.execute(
-            "UPDATE deliveries SET state='sending',attempts=attempts+1 WHERE id=?",
-            [&id],
-        )?;
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("smtp-worker")
+        let key = id.clone();
+        actor.call(move |store| {
+            store.db.execute(
+                "UPDATE deliveries SET state='sending',attempts=attempts+1 WHERE id=?",
+                [key],
+            )?;
+            Ok(())
+        })?;
+        let mut command = Command::new(process::worker_executable()?);
+        command
+            .arg("smtp-worker")
             .arg("--message")
             .arg(&message)
             .env("GIT_MONITOR_SMTP", serde_json::to_string(&mail.smtp)?)
             .env("GIT_MONITOR_TO", serde_json::to_string(&r.to)?);
-        let result = process::run(
-            &mut cmd,
+        let success = process::run(
+            &mut command,
             duration(&mail.smtp.timeout)? + Duration::from_secs(2),
             65536,
             shutdown,
             duration(&cfg.execution.shutdown_grace)?,
             None,
-        );
-        if result.is_ok_and(|o| o.code == 0) {
-            store.db.execute(
-                "UPDATE deliveries SET state='sent',error=NULL WHERE id=?",
-                [&id],
-            )?;
+        )
+        .is_ok_and(|o| o.code == 0);
+        actor.call(move|store|{if success{store.db.execute("UPDATE deliveries SET state='sent',error=NULL WHERE id=?",[id])?;}else{store.db.execute("UPDATE deliveries SET state='uncertain',error='SMTP attempt incomplete; duplicate possible',next_attempt=? + min(3600,5 * (1 << min(attempts-1,9))) WHERE id=?",params![crate::now(),id])?;}Ok(())})?;
+        if success {
             sent += 1;
-        } else {
-            store.db.execute("UPDATE deliveries SET state='uncertain',error='SMTP attempt incomplete; duplicate possible',next_attempt=? + min(3600,5 * (1 << min(attempts-1,9))) WHERE id=?",params![crate::now(),id])?;
         }
-        let _ = std::fs::remove_file(&message);
+        let _ = std::fs::remove_file(message);
     }
     Ok(sent)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn daemon(
+    cfg: &Config,
+    store: &mut Store,
+    mail: Option<&MailConfig>,
+    shutdown: &Shutdown,
+    force: bool,
+    prepare_only: bool,
+    output: Option<&Path>,
+) -> Result<()> {
+    struct Guard<'a>(&'a Shutdown);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            if !self.0.requested() {
+                self.0.request();
+            }
+        }
+    }
+    recover(store, shutdown)?;
+    crate::persistence::scope(store, |actor| {
+        std::thread::scope(|threads| {
+            let mut phases = vec![];
+            for role in ["fetch", "analysis", "report", "smtp"] {
+                phases.push(threads.spawn(move || -> Result<()> {
+                    let _guard = Guard(shutdown);
+                    let mut first = true;
+                    while !shutdown.requested() {
+                        crate::metrics::reset();
+                        let result = match role {
+                            "fetch" => {
+                                collect_actor(cfg, actor, shutdown, force && first).map(|_| ())
+                            }
+                            "analysis" => process_jobs_actor(cfg, actor, shutdown).map(|_| ()),
+                            "report" => {
+                                outputs_actor(cfg, actor, mail, shutdown, output).map(|_| ())
+                            }
+                            _ => {
+                                if let Some(mail) = mail.filter(|_| !prepare_only) {
+                                    send_actor(cfg, actor, mail, shutdown, false).map(|_| ())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
+                        if let Err(error) = result {
+                            shutdown.request();
+                            return Err(error.context(format!("{role} phase")));
+                        }
+                        actor.record_metrics(role, &crate::metrics::snapshot())?;
+                        crate::metrics::log(role);
+                        first = false;
+                        process::pause(
+                            if role == "analysis" || role == "smtp" {
+                                Duration::from_millis(100)
+                            } else {
+                                Duration::from_secs(1)
+                            },
+                            shutdown,
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            let mut failure = None;
+            for phase in phases {
+                match phase.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failure = Some(e),
+                    Err(_) => {
+                        shutdown.request();
+                        failure = Some(anyhow::anyhow!("phase panicked"));
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })
+    })
 }
 
 pub fn doctor() -> Result<String> {

@@ -1,11 +1,17 @@
 pub mod config;
 pub mod diff;
+pub mod doctor;
+pub mod document;
 pub mod git;
 pub mod mail;
+pub mod maintenance;
 pub mod model;
 pub mod monitor;
+pub mod prepare;
 pub mod process;
+pub mod profile;
 pub mod render;
+pub mod split;
 pub mod store;
 
 use sha2::{Digest, Sha256};
@@ -42,3 +48,13 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> 
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+pub mod cache;
+pub mod metrics;
+
+pub mod persistence;
+pub mod scheduler;
+
+pub mod structural;
+
+pub mod projection;
