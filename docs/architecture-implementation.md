@@ -36,3 +36,5 @@ Canonical Git histogram patches coexist with normalized Myers byte-reconstructio
 Structural correspondences have confidence/evidence labels and do not prove behavior equivalence. They supplement complete textual edits and exact selected-source exports. Current schema 3 reports read typed byte ranges; legacy rows remain a compatibility projection.
 
 The 1/10/100/1000 repeated/distinct microbenchmarks measure selector grouping. The ten-binding end-to-end benchmark and 1000-binding integration test exercise real sharing; microbenchmark timings are not claimed as full Git timings for 1000 distinct analyses. Host measurements are observations, not performance guarantees or cold-disk measurements.
+
+Current numerical observations, raw samples, environment and source fingerprint: [restored-architecture-v3](../benchmarks/baselines/restored-architecture-v3/README.md).

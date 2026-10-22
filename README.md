@@ -212,3 +212,5 @@ Immutable analysis inputs use a checksummed disk cache keyed by the frozen Git/l
 Current DiffDocument schema 3 contains selected source hashes/profile, byte edits, hunks, line pairs, source spans and syntax correspondences. Rendering reads selected bytes through these ranges; legacy rows remain a compatibility projection. Canonical histogram patches and normalized Myers reconstruction edits are separate representations. Structure annotations preserve all textual changes and carry evidence labels. Reports include native folding, local hunk/move navigation, event and aggregate filters, and repeated-commit ref provenance. Parse caches are disposable and bounded by maintenance.
 
 Planner microbenchmarks cover 1/10/100/1000 repeated and distinct selectors; these do not claim end-to-end Git timings. Integration tests exercise 1000 real identical watch bindings with one computation.
+
+The implementation/verification matrix is in [docs/architecture-implementation.md](docs/architecture-implementation.md); current measurements are in [restored-architecture-v3](benchmarks/baselines/restored-architecture-v3/README.md).
