@@ -72,12 +72,29 @@ impl Git {
     }
     fn immutable(args: &[&str]) -> bool {
         let oid = |s: &str| [40, 64].contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit());
-        matches!(
-            args.first(),
-            Some(&"show" | &"diff" | &"rev-list" | &"cat-file" | &"check-attr")
-        ) && args
+        let end = args.iter().position(|s| *s == "--").unwrap_or(args.len());
+        let positional: Vec<_> = args
             .iter()
-            .any(|s| oid(s) || s.split_once("..").is_some_and(|(a, b)| oid(a) && oid(b)))
+            .take(end)
+            .skip(1)
+            .filter(|s| !s.starts_with('-'))
+            .copied()
+            .collect();
+        match args.first().copied() {
+            Some("show") => positional.len() == 1 && oid(positional[0]),
+            Some("diff") => positional.len() == 2 && positional.iter().all(|s| oid(s)),
+            Some("rev-list") => {
+                positional.len() == 1
+                    && positional[0]
+                        .split_once("..")
+                        .is_some_and(|(a, b)| oid(a) && oid(b))
+            }
+            Some("cat-file") => {
+                args.len() == 3 && ["blob", "-s"].contains(&args[1]) && oid(args[2])
+            }
+            Some("check-attr") => args.windows(2).any(|a| a[0] == "--source" && oid(a[1])),
+            _ => false,
+        }
     }
     fn command(&self) -> Command {
         self.command_for(false)
@@ -749,6 +766,9 @@ impl Git {
         let Some(rev) = rev else {
             return Ok(None);
         };
+        if ![40, 64].contains(&rev.len()) || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return self.select_inner(Some(rev), f);
+        }
         let key = ["selected-range-v1", rev, &f.path, &f.expression];
         if let Some(bytes) = self.cached(&key) {
             if let Ok(value) = serde_json::from_slice(&bytes) {
