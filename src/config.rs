@@ -55,6 +55,7 @@ pub struct Storage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Execution {
+    pub share_computations: bool,
     pub max_fetches: usize,
     pub max_fetches_per_host: usize,
     pub max_analyses: usize,
@@ -70,6 +71,7 @@ pub struct Execution {
 impl Default for Execution {
     fn default() -> Self {
         Self {
+            share_computations: true,
             max_fetches: 4,
             max_fetches_per_host: 2,
             max_analyses: 4,
