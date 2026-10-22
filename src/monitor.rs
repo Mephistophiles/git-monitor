@@ -137,6 +137,11 @@ fn selected(
     commit_patch: bool,
 ) -> Result<(Vec<FileDiff>, Vec<String>)> {
     let w = &task.watch;
+    let profile = if task.execution.analysis_profile.git.is_empty() {
+        crate::profile::AnalysisProfile::freeze(&task.execution.diff_drivers)?
+    } else {
+        task.execution.analysis_profile.clone()
+    };
     let mut files = vec![];
     let mut notes = vec![];
     if let Some(f) = &w.function {
@@ -179,6 +184,7 @@ fn selected(
             }
             .into();
             if let Some(document) = &mut fd.document {
+                document.analysis_profile = Some(profile.clone());
                 document.old.blob = a.as_ref().map(|s| s.oid.clone());
                 document.new.blob = b.as_ref().map(|s| s.oid.clone());
                 let old_offset = a.as_ref().map_or(0, |s| s.offset);
@@ -268,6 +274,7 @@ fn selected(
                     f.note = format!("File mode {} → {}", change.old_mode, change.new_mode);
                 }
                 if let Some(document) = &mut f.document {
+                    document.analysis_profile = Some(profile.clone());
                     document.old.blob = change.old_blob.clone();
                     document.new.blob = change.new_blob.clone();
                     document.old.mode = change.old_mode.clone();

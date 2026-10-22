@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, process::Command, sync::OnceLock};
 
-pub const MODEL_VERSION: u32 = 2;
+pub const MODEL_VERSION: u32 = 3;
 pub const RENDER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +37,7 @@ impl AnalysisProfile {
                     include_str!("git.rs"),
                     include_str!("model.rs"),
                     include_str!("document.rs"),
+                    include_str!("projection.rs"),
                     include_str!("config.rs"),
                     include_str!("monitor.rs")
                 )),
@@ -58,6 +59,7 @@ impl AnalysisProfile {
 pub fn render_key() -> String {
     crate::hash(concat!(
         include_str!("render.rs"),
+        include_str!("projection.rs"),
         include_str!("report.css"),
         include_str!("report.js"),
         include_str!("mail.rs"),

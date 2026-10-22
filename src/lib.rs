@@ -56,3 +56,5 @@ pub mod persistence;
 pub mod scheduler;
 
 pub mod structural;
+
+pub mod projection;

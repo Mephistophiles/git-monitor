@@ -90,6 +90,23 @@ fn file(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
     html.replace("id=\"file-0\"", &format!("id=\"file-{index}\""))
 }
 fn file_uncached(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut projected;
+    let f = if let Some(document) = f.document.as_ref().filter(|d| !d.hunks.is_empty()) {
+        if let (Ok(old), Ok(new)) = (STANDARD.decode(&f.old_bytes), STANDARD.decode(&f.new_bytes)) {
+            if let Ok(rows) = crate::projection::rows(&document.hunks, &old, &new) {
+                projected = f.clone();
+                projected.rows = rows;
+                &projected
+            } else {
+                f
+            }
+        } else {
+            f
+        }
+    } else {
+        f
+    };
     let adds = f
         .rows
         .iter()

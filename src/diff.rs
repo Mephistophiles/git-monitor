@@ -112,9 +112,43 @@ pub fn text_rows(
     config: &DiffConfig,
     limits: &Limits,
 ) -> Vec<Row> {
+    byte_rows(
+        old.as_bytes(),
+        new.as_bytes(),
+        old_start,
+        new_start,
+        config,
+        limits,
+    )
+}
+fn byte_rows(
+    old: &[u8],
+    new: &[u8],
+    old_start: usize,
+    new_start: usize,
+    config: &DiffConfig,
+    limits: &Limits,
+) -> Vec<Row> {
+    let ranges = |bytes: &[u8]| {
+        let mut result = vec![];
+        let mut start = 0;
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                result.push(start..i + 1);
+                start = i + 1;
+            }
+        }
+        if start < bytes.len() {
+            result.push(start..bytes.len());
+        }
+        result
+    };
+    let (ar, br) = (ranges(old), ranges(new));
+    let aa: Vec<&[u8]> = ar.iter().map(|r| &old[r.clone()]).collect();
+    let bb: Vec<&[u8]> = br.iter().map(|r| &new[r.clone()]).collect();
     let diff = TextDiff::configure()
         .timeout(std::time::Duration::from_secs(2))
-        .diff_lines(old, new);
+        .diff_slices(&aa, &bb);
     let mut rows = vec![];
     for group in diff.grouped_ops(config.context_lines) {
         rows.push(Row {
@@ -127,7 +161,8 @@ pub fn text_rows(
         });
         for op in group {
             for c in diff.iter_changes(&op) {
-                let value = c.value().trim_end_matches('\n');
+                let value =
+                    String::from_utf8_lossy(c.value().strip_suffix(b"\n").unwrap_or(c.value()));
                 rows.push(Row {
                     kind: match c.tag() {
                         ChangeTag::Equal => "context",
@@ -138,12 +173,12 @@ pub fn text_rows(
                     old: c.old_index().map(|i| i + old_start),
                     new: c.new_index().map(|i| i + new_start),
                     left: if c.tag() != ChangeTag::Insert {
-                        span(value, false)
+                        span(&value, false)
                     } else {
                         vec![]
                     },
                     right: if c.tag() != ChangeTag::Delete {
-                        span(value, false)
+                        span(&value, false)
                     } else {
                         vec![]
                     },
@@ -359,8 +394,6 @@ pub fn build(
     config: &DiffConfig,
     limits: &Limits,
 ) -> FileDiff {
-    let a = String::from_utf8_lossy(old);
-    let b = String::from_utf8_lossy(new);
     let mut note = String::new();
     let mut engine = "text".to_owned();
     let mut summary = None;
@@ -382,7 +415,7 @@ pub fn build(
     }
     let mut rows = match patch {
         Some(p) => patch_rows(p, config, limits),
-        None => text_rows(&a, &b, old_start, new_start, config, limits),
+        None => byte_rows(old, new, old_start, new_start, config, limits),
     };
     if patch.is_some() && (old_start != 1 || new_start != 1) {
         for row in &mut rows {
@@ -427,6 +460,18 @@ pub fn build(
         new_start,
         limits.max_alignment_cells,
     );
+    document.hunks = match crate::projection::project(&rows, old, new, old_start, new_start) {
+        Ok(hunks) => hunks,
+        Err(_) => {
+            document
+                .quality
+                .push("presentation_projection_fallback".into());
+            rows = byte_rows(old, new, old_start, new_start, config, limits);
+            apply_highlights(path, old, new, old_start, new_start, &mut rows, limits);
+            crate::projection::project(&rows, old, new, old_start, new_start)
+                .expect("selected source coordinates")
+        }
+    };
     document.syntax_matches = matches;
     FileDiff {
         path: path.into(),

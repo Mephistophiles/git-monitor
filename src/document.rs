@@ -51,6 +51,10 @@ pub struct SyntaxMatch {
 pub struct DiffDocument {
     pub schema: u32,
     pub profile: String,
+    #[serde(default)]
+    pub analysis_profile: Option<crate::profile::AnalysisProfile>,
+    #[serde(default)]
+    pub hunks: Vec<crate::projection::Hunk>,
     pub old: SourceSlice,
     pub new: SourceSlice,
     pub edits: Vec<TextEdit>,
@@ -116,37 +120,67 @@ impl DiffDocument {
                 },
             }]
         } else {
-            similar::capture_diff_slices_deadline(
+            let ops = similar::capture_diff_slices_deadline(
                 similar::Algorithm::Myers,
                 &aa,
                 &bb,
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
-            )
-            .into_iter()
-            .map(|op| {
-                let (kind, x, y) = op.as_tag_tuple();
-                TextEdit {
-                    kind: match kind {
-                        similar::DiffTag::Equal => ChangeKind::Equal,
-                        similar::DiffTag::Delete => ChangeKind::Delete,
-                        similar::DiffTag::Insert => ChangeKind::Insert,
-                        similar::DiffTag::Replace => ChangeKind::Replace,
-                    },
-                    old: ByteRange {
+            );
+            let mut edits = vec![];
+            let (mut old_cursor, mut new_cursor) = (0, 0);
+            let gap = |edits: &mut Vec<TextEdit>, a, b, c, d| {
+                if a != b || c != d {
+                    edits.push(TextEdit {
+                        kind: if a == b {
+                            ChangeKind::Insert
+                        } else if c == d {
+                            ChangeKind::Delete
+                        } else {
+                            ChangeKind::Replace
+                        },
+                        old: ByteRange { start: a, end: b },
+                        new: ByteRange { start: c, end: d },
+                    });
+                }
+            };
+            for op in ops {
+                let (tag, x, y) = op.as_tag_tuple();
+                if tag != similar::DiffTag::Equal {
+                    continue;
+                }
+                let (ar, br) = (
+                    ByteRange {
                         start: a[x.start],
                         end: a[x.end],
                     },
-                    new: ByteRange {
+                    ByteRange {
                         start: b[y.start],
                         end: b[y.end],
                     },
+                );
+                if ar.start < old_cursor
+                    || br.start < new_cursor
+                    || old[ar.start..ar.end] != new[br.start..br.end]
+                {
+                    continue;
                 }
-            })
-            .collect()
+                gap(&mut edits, old_cursor, ar.start, new_cursor, br.start);
+                edits.push(TextEdit {
+                    kind: ChangeKind::Equal,
+                    old: ar,
+                    new: br,
+                });
+                old_cursor = ar.end;
+                new_cursor = br.end;
+            }
+            gap(&mut edits, old_cursor, old.len(), new_cursor, new.len());
+            edits
         };
         Self {
             schema: crate::profile::MODEL_VERSION,
-            profile: "byte-reconstruction-myers-v1".into(),
+            profile: "byte-reconstruction-myers-v2".into(),
+            analysis_profile: None,
+            hunks: vec![],
             old: source(old, old_line),
             new: source(new, new_line),
             edits,
@@ -204,6 +238,11 @@ impl DiffDocument {
             a == old.len() && b == new.len() && output == new,
             "edits do not reconstruct complete allowed content"
         );
+        ensure!(
+            self.old.valid_utf8 == std::str::from_utf8(old).is_ok()
+                && self.new.valid_utf8 == std::str::from_utf8(new).is_ok(),
+            "encoding label mismatch"
+        );
         for m in &self.syntax_matches {
             ensure!(
                 m.old.start <= m.old.end
@@ -213,6 +252,24 @@ impl DiffDocument {
                 "syntax match escaped selected range"
             );
         }
+        for m in &self.syntax_matches {
+            if let (Ok(a), Ok(b)) = (std::str::from_utf8(old), std::str::from_utf8(new)) {
+                ensure!(
+                    a.is_char_boundary(m.old.start)
+                        && a.is_char_boundary(m.old.end)
+                        && b.is_char_boundary(m.new.start)
+                        && b.is_char_boundary(m.new.end),
+                    "syntax match splits UTF-8"
+                );
+            }
+        }
+        crate::projection::validate(
+            &self.hunks,
+            old,
+            new,
+            self.old.start_line,
+            self.new.start_line,
+        )?;
         Ok(output)
     }
 }

@@ -115,6 +115,17 @@ impl FileDiff {
             "publishable text diff is missing its document"
         );
         if let Some(doc) = &self.document {
+            anyhow::ensure!(
+                self.path == doc.old.path
+                    && self.path == doc.new.path
+                    && self.old_start == doc.old.start_line
+                    && self.new_start == doc.new.start_line,
+                "presentation/source identity mismatch"
+            );
+            anyhow::ensure!(
+                self.rows.is_empty() || !doc.hunks.is_empty(),
+                "missing byte projection"
+            );
             doc.reconstruct(
                 &STANDARD.decode(&self.old_bytes)?,
                 &STANDARD.decode(&self.new_bytes)?,
