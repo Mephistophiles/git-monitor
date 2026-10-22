@@ -489,30 +489,10 @@ fn collect_actor(
                 shutdown: shutdown.clone(),
             };
             git.init_format(&r.object_format)?;
-            let comparison_base = if cfg.defaults.new_branch_mode == "compare" {
-                let remote = cfg
-                    .defaults
-                    .base_remote
-                    .as_deref()
-                    .context("missing base_remote")?;
-                let branch = cfg
-                    .defaults
-                    .base_branch
-                    .as_deref()
-                    .context("missing base_branch")?;
-                let source = &r.remotes[remote];
-                let Some(_permit) = hosts.acquire(&source.url, shutdown) else {
-                    return Ok((0, 0));
-                };
-                git.configure_remote(remote, &source.url)?;
-                Some(crate::model::ComparisonBase {
-                    remote: remote.into(),
-                    branch: branch.into(),
-                    oid: git.fetch_base(remote, branch)?,
-                })
-            } else {
-                None
-            };
+            // Fetch the shared base lazily, only when an active source is due.
+            // A failed base is retried on the next eligible pass, not per remote.
+            let mut comparison_base = None;
+            let mut base_failed = false;
             for (remote, source) in &r.remotes {
                 if shutdown.requested() {
                     break;
@@ -549,6 +529,48 @@ fn collect_actor(
                         .is_some_and(|(_, _, t)| crate::now().saturating_sub(*t) < interval)
                 {
                     continue;
+                }
+                if cfg.defaults.new_branch_mode == "compare" {
+                    let (poll_key, poll_repository, poll_remote) =
+                        (key.clone(), repository.clone(), remote.clone());
+                    shared
+                        .call(move |s| s.begin_poll(&poll_key, &poll_repository, &poll_remote))?;
+                    if comparison_base.is_none() && !base_failed {
+                        let base_remote = cfg
+                            .defaults
+                            .base_remote
+                            .as_deref()
+                            .context("missing base_remote")?;
+                        let branch = cfg
+                            .defaults
+                            .base_branch
+                            .as_deref()
+                            .context("missing base_branch")?;
+                        let base_source = &r.remotes[base_remote];
+                        let Some(_permit) = hosts.acquire(&base_source.url, shutdown) else {
+                            break;
+                        };
+                        git.configure_remote(base_remote, &base_source.url)?;
+                        match git.fetch_base(base_remote, branch) {
+                            Ok(oid) => {
+                                comparison_base = Some(crate::model::ComparisonBase {
+                                    remote: base_remote.into(),
+                                    branch: branch.into(),
+                                    oid,
+                                })
+                            }
+                            Err(_) if shutdown.requested() => break,
+                            Err(_) => base_failed = true,
+                        }
+                    }
+                    if base_failed {
+                        failures += 1;
+                        shared.fetch_error(&key)?;
+                        eprintln!(
+                            "comparison base fetch failed: {repository}/{remote}; retry scheduled"
+                        );
+                        continue;
+                    }
                 }
                 // Preserve every currently published object before replacing a source URL.
                 let published = git.refs(remote)?;

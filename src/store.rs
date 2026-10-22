@@ -241,8 +241,12 @@ impl Store {
             .optional()?
             .unwrap_or_else(|| identity.to_owned()))
     }
+    pub fn begin_poll(&self, key: &str, repository: &str, remote: &str) -> Result<()> {
+        self.db.execute("INSERT INTO remote_status(key,repository,remote,last_attempt,next_poll) VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET last_attempt=excluded.last_attempt,next_poll=excluded.next_poll",params![key,repository,remote,crate::now(),crate::now()+1])?;
+        Ok(())
+    }
     pub fn begin(&self, a: &Attempt) -> Result<i64> {
-        self.db.execute("INSERT INTO remote_status(key,repository,remote,last_attempt,next_poll) VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET last_attempt=excluded.last_attempt,next_poll=excluded.next_poll",params![a.key,a.repository,a.remote,crate::now(),crate::now()+1])?;
+        self.begin_poll(&a.key, &a.repository, &a.remote)?;
         self.db.execute(
             "INSERT INTO attempts(key,context) VALUES(?,?)",
             params![a.key, serde_json::to_string(a)?],

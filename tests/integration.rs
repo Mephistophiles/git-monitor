@@ -2511,3 +2511,139 @@ fn smtp_signal_preserves_uncertain_message() {
     assert_eq!(state, "uncertain");
     assert!(!mime.is_empty());
 }
+
+fn comparison_config(f: &Fixture, poll: &str) -> Config {
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[defaults]",
+            "[defaults]\nnew_branch_mode='compare'\nbase_remote='origin'\nbase_branch='main'",
+        )
+        .replace("poll_every='1s'", &format!("poll_every='{poll}'"));
+    std::fs::write(&f.config, text).unwrap();
+    let mut cfg = Config::load(&f.config).unwrap();
+    cfg.freeze().unwrap();
+    cfg
+}
+
+#[test]
+fn comparison_base_respects_poll_interval_and_inactive_watches() {
+    let f = Fixture::new(false);
+    let mut cfg = comparison_config(&f, "1h");
+    f.ok();
+    // Any network access would now fail, including the comparison-base fetch.
+    std::fs::rename(&f.remote, f.root.join("offline.git")).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let stop = Shutdown::default();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    cfg.watches.clear();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 0)
+    );
+}
+
+#[test]
+fn comparison_base_failure_backs_off_and_recovers_without_losing_observations() {
+    let f = Fixture::new(false);
+    let cfg = comparison_config(&f, "1s");
+    // Failure before the first snapshot must also establish a retry clock.
+    let offline = f.root.join("offline.git");
+    std::fs::rename(&f.remote, &offline).unwrap();
+    let mut store = Store::open(&cfg.storage.state_dir).unwrap();
+    let stop = Shutdown::default();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 1)
+    );
+    assert_eq!(f.count("attempts"), 0);
+    assert_eq!(f.count("snapshots"), 0);
+    let key: String = store
+        .db
+        .query_row("SELECT key FROM remote_status", [], |r| r.get(0))
+        .unwrap();
+    assert!(store.next_poll(&key).unwrap() > git_monitor::now());
+    // Restore access, but do not bypass backoff: no baseline may appear yet.
+    std::fs::rename(&offline, &f.remote).unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    assert_eq!(f.count("snapshots"), 0);
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (0, 0)
+    );
+    assert_eq!(f.count("snapshots"), 1);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 9"),
+        "Pending transition",
+    );
+    store
+        .db
+        .execute("UPDATE snapshots SET checked=0", [])
+        .unwrap();
+    std::fs::rename(&f.remote, &offline).unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, true).unwrap(),
+        (0, 1)
+    );
+    assert_eq!(f.count("events"), 0);
+    std::fs::rename(&offline, &f.remote).unwrap();
+    store
+        .db
+        .execute("UPDATE remote_status SET next_poll=0", [])
+        .unwrap();
+    assert_eq!(
+        git_monitor::monitor::collect(&cfg, &mut store, &stop, false).unwrap(),
+        (1, 0)
+    );
+    assert_eq!(f.count("events"), 1);
+    let failures: i64 = store
+        .db
+        .query_row("SELECT failures FROM remote_status", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(failures, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn comparison_base_failure_does_not_stop_daemon() {
+    let f = Fixture::new(false);
+    comparison_config(&f, "1s");
+    f.ok();
+    std::fs::rename(&f.remote, f.root.join("offline.git")).unwrap();
+    let mut child = Command::new(BIN)
+        .args(["--config", f.config.to_str().unwrap(), "run", "--force"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon exited on a temporary base failure"
+        );
+        let failures: i64 = f
+            .db()
+            .query_row("SELECT failures FROM remote_status", [], |r| r.get(0))
+            .unwrap();
+        if failures > 0 {
+            break;
+        }
+        if start.elapsed().as_secs() > 10 {
+            child.kill().unwrap();
+            panic!("base failure was not recorded");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    wait_for_shutdown(&mut child);
+}
