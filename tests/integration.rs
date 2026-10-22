@@ -2164,3 +2164,39 @@ fn shared_analysis_has_the_same_content_as_naive_analysis() {
         serde_json::to_value(&naive.commits).unwrap()
     );
 }
+#[test]
+fn thousand_bindings_share_a_computation_and_cached_bindings_migrate() {
+    let f = Fixture::new(false);
+    let mut cfg = Config::load(&f.config).unwrap();
+    let original = cfg.watches[0].clone();
+    for i in 1..1000 {
+        let mut watch = original.clone();
+        watch.id = format!("watch_{i}");
+        cfg.watches.push(watch);
+    }
+    std::fs::write(&f.config, toml::to_string(&cfg).unwrap()).unwrap();
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 1000"),
+        "Shared thousand",
+    );
+    let output = f.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=1"));
+    assert_eq!(f.count("computations"), 1);
+    assert_eq!(f.count("watch_jobs"), 1000);
+    assert_eq!(f.count("matches"), 1000);
+    f.db().execute("DELETE FROM watch_jobs", []).unwrap();
+    f.db().execute("DELETE FROM computations", []).unwrap();
+    f.db()
+        .execute("UPDATE jobs SET state='pending'", [])
+        .unwrap();
+    let output = f.run();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=0"));
+    assert_eq!(f.count("watch_jobs"), 1000);
+}
