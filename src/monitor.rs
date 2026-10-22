@@ -16,6 +16,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -370,6 +371,14 @@ pub fn fetch_attempt(
     attempt: &mut Attempt,
     git: &Git,
 ) -> Result<BTreeMap<String, String>> {
+    fetch_attempt_journal(id, attempt, git, |a| store.update_attempt(id, a))
+}
+fn fetch_attempt_journal(
+    id: i64,
+    attempt: &mut Attempt,
+    git: &Git,
+    journal: impl Fn(&Attempt) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
     if matches!(attempt.plan, FetchPlan::All) {
         git.fetch(&attempt.remote, !attempt.initialized)?;
         return git.refs(&attempt.remote);
@@ -393,7 +402,7 @@ pub fn fetch_attempt(
                 previous_marker: previous_marker.clone(),
             }),
         };
-        store.update_attempt(id, attempt)?;
+        journal(attempt)?;
         match git.download_selected(&attempt.remote, &staging, &desired, !attempt.initialized) {
             Ok(true) => {
                 git.publish_selected(
@@ -421,197 +430,292 @@ pub fn collect(
     shutdown: &Shutdown,
     force: bool,
 ) -> Result<(usize, usize)> {
-    let mut events = recover(store, shutdown)?;
-    store.retire_disabled_sources(cfg)?;
-    let mut failures = 0;
-    for (repository, r) in &cfg.repositories {
-        if shutdown.requested() {
-            break;
-        }
-        let git = Git {
-            path: repository_path(&cfg.storage.repositories_dir, repository),
-            execution: cfg.execution.clone(),
-            limits: cfg.limits.clone(),
-            shutdown: shutdown.clone(),
-        };
-        git.init_format(&r.object_format)?;
-        for (remote, source) in &r.remotes {
+    crate::persistence::scope(store, |shared| collect_actor(cfg, shared, shutdown, force))
+}
+fn collect_actor(
+    cfg: &Config,
+    shared: &crate::persistence::Actor,
+    shutdown: &Shutdown,
+    force: bool,
+) -> Result<(usize, usize)> {
+    let stop = shutdown.clone();
+    let recovered = shared.call(move |s| recover(s, &stop))?;
+    let frozen = cfg.clone();
+    shared.call(move |s| s.retire_disabled_sources(&frozen))?;
+    let hosts = crate::scheduler::Hosts::new(cfg.execution.max_fetches_per_host);
+    let results = crate::scheduler::map(
+        cfg.repositories.iter().collect(),
+        cfg.execution.max_fetches,
+        |(repository, r)| -> Result<(usize, usize)> {
+            let (mut events, mut failures) = (0, 0);
             if shutdown.requested() {
-                break;
+                return Ok((0, 0));
             }
-            let watches: Vec<_> = cfg
-                .watches
-                .iter()
-                .filter(|w| w.repository == *repository && w.remotes.contains(remote))
-                .cloned()
-                .collect();
-            if watches.is_empty() {
-                continue;
-            }
-            let key = store.activate_source(
-                repository,
-                remote,
-                &crate::store::source_identity(repository, remote, source),
-            )?;
-            let snapshot = store.snapshot(&key)?;
-            let interval = duration(
-                source
-                    .poll_every
-                    .as_deref()
-                    .unwrap_or(&cfg.defaults.poll_every),
-            )?
-            .as_secs();
-            if !force && crate::now() < store.next_poll(&key)? {
-                continue;
-            }
-            if !force
-                && snapshot
-                    .as_ref()
-                    .is_some_and(|(_, _, t)| crate::now().saturating_sub(*t) < interval)
-            {
-                continue;
-            }
-            // Preserve every currently published object before replacing a source URL.
-            let published = git.refs(remote)?;
-            for oid in published.values() {
-                git.pin(oid)?;
-            }
-            let plan = FetchPlan::for_watches(&watches);
-            let mut attempt = Attempt {
-                key: key.clone(),
-                repository: repository.clone(),
-                remote: remote.clone(),
-                path: git.path.clone(),
-                old: snapshot.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
-                published,
-                initialized: snapshot.is_some(),
-                previous: snapshot.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
-                watches,
+            let git = Git {
+                path: repository_path(&cfg.storage.repositories_dir, repository),
                 execution: cfg.execution.clone(),
                 limits: cfg.limits.clone(),
-                diff: cfg.diff.clone(),
-                plan,
+                shutdown: shutdown.clone(),
             };
-            for oid in attempt.old.values() {
-                git.pin(oid)?;
-            }
-            git.configure_remote(remote, &source.url)?;
-            let id = store.begin(&attempt)?;
-            match fetch_attempt(store, id, &mut attempt, &git) {
-                Ok(refs) => {
-                    events += store.finish(id, &attempt, refs, &git)?;
-                    eprintln!("checked {repository}/{remote}");
+            git.init_format(&r.object_format)?;
+            for (remote, source) in &r.remotes {
+                if shutdown.requested() {
+                    break;
                 }
-                Err(_) => {
-                    if shutdown.requested() {
-                        // Keep the attempt: deadline expiry must not start fresh Git work.
-                        break;
+                let watches: Vec<_> = cfg
+                    .watches
+                    .iter()
+                    .filter(|w| w.repository == *repository && w.remotes.contains(remote))
+                    .cloned()
+                    .collect();
+                if watches.is_empty() {
+                    continue;
+                }
+                let key = shared.activate_source(
+                    repository,
+                    remote,
+                    &crate::store::source_identity(repository, remote, source),
+                )?;
+                let snapshot = shared.snapshot(&key)?;
+                let interval = duration(
+                    source
+                        .poll_every
+                        .as_deref()
+                        .unwrap_or(&cfg.defaults.poll_every),
+                )?
+                .as_secs();
+                let interval = crate::scheduler::poll_interval(&key, interval);
+                if !force && crate::now() < shared.next_poll(&key)? {
+                    continue;
+                }
+                if !force
+                    && snapshot
+                        .as_ref()
+                        .is_some_and(|(_, _, t)| crate::now().saturating_sub(*t) < interval)
+                {
+                    continue;
+                }
+                // Preserve every currently published object before replacing a source URL.
+                let published = git.refs(remote)?;
+                for oid in published.values() {
+                    git.pin(oid)?;
+                }
+                let plan = FetchPlan::for_watches(&watches);
+                let mut attempt = Attempt {
+                    key: key.clone(),
+                    repository: repository.clone(),
+                    remote: remote.clone(),
+                    path: git.path.clone(),
+                    old: snapshot.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
+                    published,
+                    initialized: snapshot.is_some(),
+                    previous: snapshot.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
+                    watches,
+                    execution: cfg.execution.clone(),
+                    limits: cfg.limits.clone(),
+                    diff: cfg.diff.clone(),
+                    plan,
+                };
+                for oid in attempt.old.values() {
+                    git.pin(oid)?;
+                }
+                git.configure_remote(remote, &source.url)?;
+                let Some(_permit) = hosts.acquire(&source.url, shutdown) else {
+                    break;
+                };
+                let id = shared.begin(&attempt)?;
+                match fetch_attempt_journal(id, &mut attempt, &git, |a| {
+                    shared.update_attempt(id, a)
+                }) {
+                    Ok(refs) => {
+                        events += shared.finish(id, &attempt, refs, &git)?;
+                        eprintln!("checked {repository}/{remote}");
                     }
-                    failures += 1;
-                    recover(store, shutdown)?;
-                    store.fetch_error(&key)?;
-                    eprintln!("fetch failed: {repository}/{remote}; local result reconciled");
+                    Err(_) => {
+                        if shutdown.requested() {
+                            // Keep the attempt: deadline expiry must not start fresh Git work.
+                            break;
+                        }
+                        failures += 1;
+                        shared.fetch_error(&key)?;
+                        eprintln!("fetch failed: {repository}/{remote}; local result reconciled");
+                    }
                 }
             }
+            Ok((events, failures))
+        },
+    );
+    let (mut events, mut failures, mut error) = (recovered, 0, None);
+    for result in results {
+        match result {
+            Ok((e, f)) => {
+                events += e;
+                failures += f;
+            }
+            Err(e) => error = Some(e),
         }
+    }
+    if !shutdown.requested() {
+        let stop = shutdown.clone();
+        events += shared.call(move |s| recover(s, &stop))?;
+    }
+    if let Some(error) = error {
+        return Err(error);
     }
     Ok((events, failures))
 }
 
+pub fn analysis_key(cfg: &Config, task: &Task) -> Result<String> {
+    Ok(crate::hash(serde_json::to_vec(&(
+        if cfg.execution.analysis_profile.git.is_empty() {
+            crate::profile::AnalysisProfile::freeze(&cfg.execution.diff_drivers)?.key()
+        } else {
+            cfg.execution.analysis_profile.key()
+        },
+        &task.event.repository,
+        &task.path,
+        &task.event.old,
+        &task.event.new,
+        &task.event.kind,
+        task.watch.selector_key(),
+        task.previous_watch.as_ref().map(Watch::selector_key),
+        &task.diff,
+        &task.limits,
+    ))?))
+}
 pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Result<usize> {
+    crate::persistence::scope(store, |shared| process_jobs_actor(cfg, shared, shutdown))
+}
+fn process_jobs_actor(
+    cfg: &Config,
+    shared: &crate::persistence::Actor,
+    shutdown: &Shutdown,
+) -> Result<usize> {
     let tmp = cfg.storage.state_dir.join("tmp");
     std::fs::create_dir_all(&tmp)?;
-    let mut analyses = 0;
-    for (id, mut task) in store.jobs()? {
+    let frozen = Arc::new(cfg.clone());
+    let mut groups: BTreeMap<String, Vec<(i64, Task)>> = BTreeMap::new();
+    for (id, mut task) in shared.call(|s| s.jobs())? {
         task.execution = cfg.execution.clone();
         task.limits = cfg.limits.clone();
         task.diff = cfg.diff.clone();
-        if shutdown.requested() {
-            break;
+        let mut key = analysis_key(cfg, &task)?;
+        if !cfg.execution.share_computations {
+            key = crate::hash(format!("{key}:{id}"));
         }
-        let key = crate::hash(serde_json::to_vec(&(
-            if cfg.execution.analysis_profile.git.is_empty() {
-                crate::profile::AnalysisProfile::freeze(&cfg.execution.diff_drivers)?.key()
-            } else {
-                cfg.execution.analysis_profile.key()
-            },
-            &task.event.repository,
-            &task.path,
-            &task.event.old,
-            &task.event.new,
-            &task.event.kind,
-            task.watch.selector_key(),
-            task.previous_watch.as_ref().map(Watch::selector_key),
-            &task.diff,
-            &task.limits,
-        ))?);
-        if let Some(result) = store
-            .cache(&key)?
-            .filter(|_| cfg.execution.share_computations)
-        {
-            crate::metrics::update(|s| s.analysis_cache_hits += 1);
-            store.finish_job(id, &task, &key, &result, None, cfg)?;
-            continue;
-        }
-        store
-            .db
-            .execute("UPDATE jobs SET state='running' WHERE id=?", [id])?;
-        let input = tmp.join(format!("job-{id}.json"));
-        let output = tmp.join(format!("result-{id}.json"));
-        crate::atomic_write(&input, &serde_json::to_vec(&task)?)?;
-        let mut cmd = Command::new(process::worker_executable()?);
-        cmd.arg("worker")
-            .arg("--input")
-            .arg(&input)
-            .arg("--output")
-            .arg(&output);
-        let run = process::run(
-            &mut cmd,
-            duration(&cfg.limits.analysis_timeout)?,
-            65536,
-            shutdown,
-            duration(&cfg.execution.shutdown_grace)?,
-            Some(cfg.limits.max_worker_address_space_bytes),
-        );
-        analyses += 1;
-        crate::metrics::update(|s| s.analyses += 1);
-        let result = run.and_then(|o| {
-            ensure!(
-                o.code == 0,
-                "analysis worker failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let size = std::fs::metadata(&output)?.len();
-            ensure!(
-                size <= cfg.limits.max_job_output_bytes as u64,
-                "analysis output budget exceeded"
-            );
-            Ok(serde_json::from_slice::<Analysis>(&std::fs::read(
-                &output,
-            )?)?)
-        });
-        match result {
-            Ok(result) => store.finish_job(id, &task, &key, &result, None, cfg)?,
-            Err(e) => {
-                if shutdown.requested() {
-                    store
-                        .db
-                        .execute("UPDATE jobs SET state='pending' WHERE id=?", [id])?;
-                } else {
-                    let error = e.to_string();
-                    let result = Analysis {
-                        notes: vec![format!("analysis_failed: {error}")],
-                        ..Default::default()
-                    };
-                    store.finish_job(id, &task, &key, &result, Some(&error), cfg)?;
-                    eprintln!("analysis job {id} failed");
+        groups.entry(key).or_default().push((id, task));
+    }
+    let results = crate::scheduler::map(
+        groups.into_iter().collect(),
+        cfg.execution.max_analyses,
+        |(key, bindings)| -> Result<usize> {
+            if shutdown.requested() {
+                return Ok(0);
+            }
+            let task = &bindings[0].1;
+            if cfg.execution.share_computations {
+                let (key, bindings, cfg) = (key.clone(), bindings.clone(), frozen.clone());
+                if shared.call(move |s| {
+                    if let Some(result) = s.cache(&key)? {
+                        for (id, task) in &bindings {
+                            s.finish_job(*id, task, &key, &result, None, &cfg)?;
+                        }
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })? {
+                    crate::metrics::update(|s| s.analysis_cache_hits += 1);
+                    return Ok(0);
                 }
             }
-        }
-        let _ = std::fs::remove_file(input);
-        let _ = std::fs::remove_file(output);
+            let timeout = duration(&cfg.limits.analysis_timeout)?;
+            let token =
+                shared.claim_computation(&key, &bindings, timeout.as_secs().saturating_add(60))?;
+            let input = tmp.join(format!("job-{token}.json"));
+            let output = tmp.join(format!("result-{token}.json"));
+            crate::atomic_write(&input, &serde_json::to_vec(task)?)?;
+            let mut command = Command::new(process::worker_executable()?);
+            command
+                .arg("worker")
+                .arg("--input")
+                .arg(&input)
+                .arg("--output")
+                .arg(&output);
+            let result = process::run(
+                &mut command,
+                timeout,
+                65536,
+                shutdown,
+                duration(&cfg.execution.shutdown_grace)?,
+                Some(cfg.limits.max_worker_address_space_bytes),
+            )
+            .and_then(|out| {
+                ensure!(
+                    out.code == 0,
+                    "analysis worker failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                ensure!(
+                    std::fs::metadata(&output)?.len() <= cfg.limits.max_job_output_bytes as u64,
+                    "analysis output budget exceeded"
+                );
+                let result: Analysis = serde_json::from_slice(&std::fs::read(&output)?)?;
+                for file in result
+                    .files
+                    .iter()
+                    .chain(result.commits.iter().flat_map(|c| &c.files))
+                {
+                    file.validate()?;
+                }
+                Ok(result)
+            });
+            let cfg = frozen.clone();
+            let interrupted = shutdown.requested();
+            shared.call(move |s| {
+                if s.owns_computation(&key, &token)? {
+                    match result {
+                        Ok(result) => {
+                            s.record_metrics("analysis-worker", &result.counters)?;
+                            for (id, task) in &bindings {
+                                s.finish_job(*id, task, &key, &result, None, &cfg)?;
+                            }
+                            s.release_computation(&key, &token, Some(&result))?;
+                        }
+                        Err(error) => {
+                            if interrupted {
+                                for (id, _) in &bindings {
+                                    s.db.execute(
+                                        "UPDATE jobs SET state='pending' WHERE id=?",
+                                        [id],
+                                    )?;
+                                }
+                            } else {
+                                let error = error.to_string();
+                                let result = Analysis {
+                                    notes: vec![format!("analysis_failed: {error}")],
+                                    ..Default::default()
+                                };
+                                for (id, task) in &bindings {
+                                    s.finish_job(*id, task, &key, &result, Some(&error), &cfg)?;
+                                }
+                            }
+                            s.release_computation(&key, &token, None)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            let _ = std::fs::remove_file(input);
+            let _ = std::fs::remove_file(output);
+            Ok(1)
+        },
+    );
+    let mut count = 0;
+    for result in results {
+        count += result?;
     }
-    Ok(analyses)
+    crate::metrics::update(|s| s.analyses += count as u64);
+    Ok(count)
 }
 
 fn allowed(

@@ -148,11 +148,14 @@ impl Store {
           CREATE TABLE IF NOT EXISTS maintenance_log(id INTEGER PRIMARY KEY,body TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS delivery_times(digest TEXT PRIMARY KEY,created INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS stage_metrics(id INTEGER PRIMARY KEY,stage TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS computations(key TEXT PRIMARY KEY,generation INTEGER NOT NULL,token TEXT NOT NULL,state TEXT NOT NULL,expires INTEGER NOT NULL,result_hash TEXT);
+          CREATE TABLE IF NOT EXISTS watch_jobs(job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,computation TEXT NOT NULL,selector TEXT NOT NULL);
           PRAGMA user_version=3; COMMIT;")?;
         db.execute(
             "INSERT OR IGNORE INTO delivery_times SELECT DISTINCT digest,? FROM deliveries",
             [crate::now()],
         )?;
+        db.execute("UPDATE computations SET state='pending',generation=generation+1,token='' WHERE state='running'",[])?;
         // A single instance owns the DB; any running jobs were interrupted.
         db.execute("UPDATE jobs SET state='pending' WHERE state='running'", [])?;
         db.execute(
@@ -398,7 +401,53 @@ impl Store {
             .optional()?
             .unwrap_or(0))
     }
+    pub fn claim_computation(
+        &mut self,
+        key: &str,
+        bindings: &[(i64, Task)],
+        seconds: u64,
+    ) -> Result<String> {
+        let tx = self.db.transaction()?;
+        let generation: i64 = tx
+            .query_row(
+                "SELECT generation FROM computations WHERE key=?",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            + 1;
+        let token = crate::hash(format!(
+            "{key}:{generation}:{}:{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        tx.execute("INSERT INTO computations VALUES(?,?,?,'running',?,NULL) ON CONFLICT(key) DO UPDATE SET generation=excluded.generation,token=excluded.token,state='running',expires=excluded.expires,result_hash=NULL",params![key,generation,token,crate::now().saturating_add(seconds)])?;
+        for (id, task) in bindings {
+            tx.execute(
+                "INSERT OR REPLACE INTO watch_jobs VALUES(?,?,?)",
+                params![id, key, task.watch.selector_key()],
+            )?;
+            tx.execute("UPDATE jobs SET state='running' WHERE id=?", [id])?;
+        }
+        tx.commit()?;
+        Ok(token)
+    }
+    pub fn owns_computation(&self, key: &str, token: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM computations WHERE key=? AND token=? AND state='running' AND expires>=?)",params![key,token,crate::now()],|r|r.get(0))?)
+    }
+    pub fn release_computation(
+        &self,
+        key: &str,
+        token: &str,
+        result: Option<&Analysis>,
+    ) -> Result<()> {
+        self.db.execute("UPDATE computations SET state=?,result_hash=? WHERE key=? AND token=? AND state='running'",params![if result.is_some(){"done"}else{"pending"},result.map(|r|crate::hash(serde_json::to_vec(r).unwrap())),key,token])?;
+        Ok(())
+    }
     pub fn jobs(&self) -> Result<Vec<(i64, Task)>> {
+        self.db.execute("UPDATE jobs SET state='pending' WHERE state='running' AND id IN (SELECT w.job_id FROM watch_jobs w JOIN computations c ON c.key=w.computation WHERE c.state='running' AND c.expires<?)",[crate::now()])?;
+        self.db.execute("UPDATE computations SET state='pending',generation=generation+1,token='' WHERE state='running' AND expires<?",[crate::now()])?;
         let mut q = self
             .db
             .prepare("SELECT id,task FROM jobs WHERE state='pending' ORDER BY id")?;
@@ -453,6 +502,14 @@ impl Store {
         });
         let tx = self.db.transaction()?;
         if error.is_none() && cfg.execution.share_computations {
+            tx.execute(
+                "INSERT OR IGNORE INTO computations VALUES(?,0,'','done',0,?)",
+                params![key, crate::hash(serde_json::to_vec(result)?)],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO watch_jobs VALUES(?,?,?)",
+                params![id, key, task.watch.selector_key()],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO cache(key,body) VALUES(?,?)",
                 params![key, serde_json::to_string(result)?],

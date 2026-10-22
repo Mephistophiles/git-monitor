@@ -69,6 +69,7 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
         [cfg.maintenance.cache_items as u64],
     )?;
     tx.execute("DELETE FROM cache WHERE rowid IN (SELECT rowid FROM (SELECT rowid,SUM(length(body)) OVER(ORDER BY rowid DESC) AS bytes FROM cache) WHERE bytes>?)",[cfg.maintenance.cache_bytes])?;
+    tx.execute("DELETE FROM computations WHERE NOT EXISTS(SELECT 1 FROM watch_jobs w WHERE w.computation=computations.key)",[])?;
     tx.commit()?;
     let mut roots: BTreeMap<std::path::PathBuf, BTreeSet<String>> = BTreeMap::new();
     for entry in std::fs::read_dir(&cfg.storage.repositories_dir)? {
