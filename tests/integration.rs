@@ -2203,3 +2203,311 @@ fn thousand_bindings_share_a_computation_and_cached_bindings_migrate() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("analyses=0"));
     assert_eq!(f.count("watch_jobs"), 1000);
 }
+
+#[test]
+fn new_branch_compares_against_explicit_frozen_base() {
+    let f = Fixture::new(true);
+    let text = std::fs::read_to_string(&f.config).unwrap().replace(
+        "[defaults]",
+        "[defaults]\nnew_branch_mode='compare'\nbase_remote='origin'\nbase_branch='main'",
+    );
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    git(&f.work, &["switch", "-qc", "feature"]);
+    std::fs::write(
+        f.work.join("test.c"),
+        BEFORE.replace("value > 0", "value >= 4"),
+    )
+    .unwrap();
+    git(&f.work, &["commit", "-qam", "Feature change"]);
+    git(&f.work, &["push", "-q", "origin", "feature"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert_eq!(event.kind, "branch_created");
+    assert_eq!(event.comparison_base.unwrap().branch, "main");
+    assert!(!event.files.is_empty());
+    assert!(body.contains("explicit base origin/main"));
+    assert!(!f.report().contains("PRIVATE_NEIGHBOR"));
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace("base_remote='origin'\n", "");
+    std::fs::write(&f.config, text).unwrap();
+    assert!(Config::load(&f.config).is_err());
+}
+#[test]
+fn octopus_merge_retains_side_commits_first_parent_patch_and_aggregate() {
+    let f = Fixture::new(false);
+    f.ok();
+    let base = git(&f.work, &["rev-parse", "HEAD"]);
+    for (branch, path) in [("side_one", "one.c"), ("side_two", "two.c")] {
+        git(&f.work, &["switch", "-qc", branch, &base]);
+        std::fs::write(f.work.join(path), format!("int {branch}(){{return 1;}}\n")).unwrap();
+        git(&f.work, &["add", "."]);
+        git(&f.work, &["commit", "-qm", branch]);
+    }
+    git(&f.work, &["switch", "-q", "main"]);
+    git(
+        &f.work,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "Octopus integration",
+            "side_one",
+            "side_two",
+        ],
+    );
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    assert_eq!(event.commits.len(), 3);
+    assert_eq!(
+        event
+            .commits
+            .iter()
+            .find(|c| c.subject == "Octopus integration")
+            .unwrap()
+            .files
+            .len(),
+        2
+    );
+    assert_eq!(event.files.len(), 2);
+}
+#[test]
+fn cpp_custom_rules_preserve_overload_selection_and_distinguish_missing_objects() {
+    let f = Fixture::new(true);
+    let path = f.work.join("overload.cpp");
+    let before="int target(int x) {\n return x;\n}\ndouble target(double x) {\n return x;\n}\nint PRIVATE_NEIGHBOR(){return 900;}\n";
+    std::fs::write(&path, before).unwrap();
+    std::fs::write(f.work.join(".gitattributes"), "*.cpp diff=selected\n").unwrap();
+    git(&f.work, &["add", "."]);
+    git(&f.work, &["commit", "-qm", "C++ fixture"]);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    let text = std::fs::read_to_string(&f.config)
+        .unwrap()
+        .replace(
+            "[execution]",
+            "[execution]\ndiff_drivers={selected='^int [a-zA-Z_][a-zA-Z_0-9]*.*$'}",
+        )
+        .replace("path = 'test.c'", "path = 'overload.cpp'");
+    std::fs::write(&f.config, text).unwrap();
+    f.ok();
+    std::fs::write(&path, before.replacen("return x;", "return x+1;", 1)).unwrap();
+    git(&f.work, &["commit", "-qam", "Selected overload"]);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    f.ok();
+    let body: String = f
+        .db()
+        .query_row("SELECT body FROM matches", [], |r| r.get(0))
+        .unwrap();
+    let event: git_monitor::model::EventView = serde_json::from_str(&body).unwrap();
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let selected = String::from_utf8(
+        STANDARD
+            .decode(&event.commits[0].files[0].new_bytes)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(selected.starts_with("int target"));
+    assert!(selected.contains("x+1"));
+    assert!(!selected.contains("PRIVATE_NEIGHBOR"));
+    let cfg = Config::load(&f.config).unwrap();
+    let repository = Git {
+        path: repository_path(&cfg.storage.repositories_dir, "project"),
+        execution: cfg.execution,
+        limits: cfg.limits,
+        shutdown: Shutdown::default(),
+    };
+    assert!(repository
+        .tree_blob(&"0".repeat(40), "overload.cpp")
+        .is_err());
+    assert!(repository
+        .tree_blob(event.new.as_deref().unwrap(), "absent.cpp")
+        .unwrap()
+        .is_none());
+}
+#[cfg(unix)]
+fn wait_for_shutdown(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if start.elapsed().as_secs() > 3 {
+            child.kill().unwrap();
+            panic!("shutdown deadline exceeded");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+#[cfg(unix)]
+fn stalled_analysis(f: &Fixture, persistent: bool) -> (std::process::Child, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = f.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let actual = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let actual = String::from_utf8(actual.stdout).unwrap();
+    let marker = f.root.join("analysis-started");
+    let wrapper = bin.join("git");
+    std::fs::write(&wrapper,format!("#!/bin/sh\ncase \" $* \" in *' show '*) if mkdir '{}' 2>/dev/null; then sleep 30; fi;; esac\nexec '{}' \"$@\"\n",marker.display(),actual.trim())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(BIN);
+    command.args(["--config", f.config.to_str().unwrap(), "run", "--force"]);
+    if !persistent {
+        command.arg("--once");
+    }
+    let mut child = command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while !marker.exists() {
+        if start.elapsed().as_secs() > 15 {
+            child.kill().unwrap();
+            panic!("analysis did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (child, marker)
+}
+#[test]
+#[cfg(unix)]
+fn analysis_signal_preserves_frozen_configuration_and_pending_lease() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 5"),
+        "Interrupted analysis",
+    );
+    let (mut child, _) = stalled_analysis(&f, false);
+    let original = std::fs::read(&f.config).unwrap();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGHUP);
+    }
+    std::fs::write(&f.config, "invalid changed TOML").unwrap();
+    wait_for_shutdown(&mut child);
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT count(*) FROM computations WHERE state='running'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db()
+            .query_row("SELECT count(*) FROM jobs WHERE state='pending'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    std::fs::write(&f.config, original).unwrap();
+    f.ok();
+    assert_eq!(f.count("matches"), 1);
+}
+#[test]
+#[cfg(unix)]
+fn daemon_fetch_progresses_while_previous_analysis_is_stalled() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 10"),
+        "First transition",
+    );
+    let (mut child, _) = stalled_analysis(&f, true);
+    f.change(
+        &BEFORE.replace("value > 0", "value > 20"),
+        "Second transition",
+    );
+    let start = std::time::Instant::now();
+    while f.count("events") < 2 {
+        if start.elapsed().as_secs() > 7 {
+            child.kill().unwrap();
+            panic!("fetch clock blocked behind analysis");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    wait_for_shutdown(&mut child);
+    f.ok();
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE state IN ('pending','running')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+#[test]
+#[cfg(unix)]
+fn smtp_signal_preserves_uncertain_message() {
+    let f = Fixture::new(false);
+    f.ok();
+    f.change(
+        &BEFORE.replace("value > 0", "value > 15"),
+        "Interrupted SMTP",
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mail = f.root.join("mail.toml");
+    std::fs::write(&mail,format!("version=1\n[smtp]\nhost='127.0.0.1'\nport={port}\nsecurity='none'\nfrom='test@example.invalid'\ntimeout='30s'\n")).unwrap();
+    let mut child = Command::new(BIN)
+        .args([
+            "--config",
+            f.config.to_str().unwrap(),
+            "--mail-config",
+            mail.to_str().unwrap(),
+            "run",
+            "--once",
+            "--force",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let _socket = loop {
+        if let Ok((socket, _)) = listener.accept() {
+            break socket;
+        }
+        if start.elapsed().as_secs() > 15 {
+            child.kill().unwrap();
+            panic!("SMTP did not start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    wait_for_shutdown(&mut child);
+    let (state, mime): (String, Vec<u8>) = f
+        .db()
+        .query_row("SELECT state,mime FROM deliveries", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "uncertain");
+    assert!(!mime.is_empty());
+}
