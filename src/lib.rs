@@ -54,3 +54,5 @@ pub mod metrics;
 
 pub mod persistence;
 pub mod scheduler;
+
+pub mod structural;

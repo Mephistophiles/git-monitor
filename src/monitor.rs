@@ -288,6 +288,11 @@ fn selected(
 }
 
 pub fn analyze(task: &Task) -> Result<Analysis> {
+    crate::structural::set_cache(
+        task.execution
+            .share_computations
+            .then(|| task.path.join("git-monitor-syntax-cache")),
+    );
     let git = Git {
         path: task.path.clone(),
         execution: task.execution.clone(),

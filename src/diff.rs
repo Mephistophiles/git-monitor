@@ -1,6 +1,6 @@
 use crate::{
-    config::{duration, DiffConfig, Limits},
-    model::{FileDiff, Row, Span, SyntaxSummary},
+    config::{DiffConfig, Limits},
+    model::{FileDiff, Row, Span},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use similar::{ChangeTag, TextDiff};
@@ -336,7 +336,7 @@ fn align(rows: Vec<Row>, config: &DiffConfig, limits: &Limits) -> Vec<Row> {
     out
 }
 
-fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
+pub(crate) fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
     match path.rsplit('.').next()? {
         "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), "C")),
         "cpp" | "cc" | "hpp" | "cxx" | "hh" => Some((tree_sitter_cpp::LANGUAGE.into(), "C++")),
@@ -345,100 +345,6 @@ fn grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
         "json" => Some((tree_sitter_json::LANGUAGE.into(), "JSON")),
         _ => None,
     }
-}
-
-fn syntax(
-    path: &str,
-    old: &[u8],
-    new: &[u8],
-    limits: &Limits,
-) -> Result<(SyntaxSummary, String), String> {
-    let (language, name) = grammar(path).ok_or("unsupported_language")?;
-    if std::str::from_utf8(old).is_err() || std::str::from_utf8(new).is_err() {
-        return Err("invalid_utf8".into());
-    }
-    let start = Instant::now();
-    let timeout = duration(&limits.syntax_timeout).map_err(|_| "syntax_budget_exceeded")?;
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|_| "grammar_error")?;
-    #[allow(deprecated)]
-    parser.set_timeout_micros(timeout.as_micros().min(u64::MAX as u128) as u64);
-    let mut sides = vec![];
-    for source in [old, new] {
-        let tree = parser.parse(source, None).ok_or("syntax_budget_exceeded")?;
-        if tree.root_node().has_error() {
-            return Err("parse_error".into());
-        }
-        let mut stack = vec![tree.root_node()];
-        let mut count = 0;
-        let mut tokens = vec![];
-        let mut structure = Vec::new();
-        let mut hashes = BTreeSet::new();
-        while let Some(node) = stack.pop() {
-            count += 1;
-            if count > limits.max_syntax_nodes || start.elapsed() > timeout {
-                return Err("syntax_budget_exceeded".into());
-            }
-            if node.kind().contains("comment") {
-                continue;
-            }
-            // Preorder node kinds plus significant child counts encode the
-            // tree shape without byte offsets or comments. Leaf tokens alone
-            // cannot distinguish Python indentation/control-flow changes.
-            let children = (0..node.child_count())
-                .filter_map(|i| node.child(i))
-                .filter(|child| !child.kind().contains("comment"))
-                .count();
-            structure.push((node.kind_id(), children));
-            if node.child_count() == 0 {
-                tokens.push(format!(
-                    "{}:{}",
-                    node.kind(),
-                    String::from_utf8_lossy(&source[node.byte_range()])
-                ));
-            } else {
-                if node.is_named() && node.end_byte() - node.start_byte() <= 8192 {
-                    hashes.insert(crate::hash(&source[node.byte_range()]));
-                }
-                for n in (0..node.child_count()).rev() {
-                    if let Some(c) = node.child(n) {
-                        stack.push(c);
-                    }
-                }
-            }
-        }
-        sides.push((tokens, hashes, structure));
-    }
-    if sides[0].0.len().saturating_mul(sides[1].0.len()) > limits.max_syntax_candidates {
-        return Err("syntax_budget_exceeded".into());
-    }
-    let a: Vec<_> = sides[0].0.iter().map(String::as_str).collect();
-    let b: Vec<_> = sides[1].0.iter().map(String::as_str).collect();
-    let ops = similar::capture_diff_slices_deadline(
-        similar::Algorithm::Myers,
-        &a,
-        &b,
-        Some(start + timeout),
-    );
-    let (mut deleted, mut inserted) = (0, 0);
-    for op in ops {
-        let (tag, old_range, new_range) = op.as_tag_tuple();
-        if tag != similar::DiffTag::Equal {
-            deleted += old_range.len();
-            inserted += new_range.len();
-        }
-    }
-    Ok((
-        SyntaxSummary {
-            unchanged_subtrees: sides[0].1.intersection(&sides[1].1).count(),
-            deleted_tokens: deleted,
-            inserted_tokens: inserted,
-            text_only_change: a == b && sides[0].2 == sides[1].2 && old != new,
-        },
-        name.into(),
-    ))
 }
 
 // The two source buffers carry independent original-file coordinates.
@@ -458,10 +364,12 @@ pub fn build(
     let mut note = String::new();
     let mut engine = "text".to_owned();
     let mut summary = None;
+    let mut matches = vec![];
     let mut language = grammar(path).map(|(_, s)| s.to_owned()).unwrap_or_default();
     if config.mode != "text" {
-        match syntax(path, old, new, limits) {
-            Ok((s, name)) => {
+        match crate::structural::compare(path, old, new, limits) {
+            Ok((s, name, syntax_matches)) => {
+                matches = syntax_matches;
                 engine = "syntax".into();
                 language = name;
                 summary = Some(s);
@@ -511,6 +419,15 @@ pub fn build(
         note.push_str(" · new source has no final newline");
     }
     apply_highlights(path, old, new, old_start, new_start, &mut rows, limits);
+    let mut document = crate::document::DiffDocument::build(
+        path,
+        old,
+        new,
+        old_start,
+        new_start,
+        limits.max_alignment_cells,
+    );
+    document.syntax_matches = matches;
     FileDiff {
         path: path.into(),
         kind: if old.is_empty() {
@@ -531,14 +448,7 @@ pub fn build(
         language,
         syntax: summary,
         continuation: None,
-        document: Some(crate::document::DiffDocument::build(
-            path,
-            old,
-            new,
-            old_start,
-            new_start,
-            limits.max_alignment_cells,
-        )),
+        document: Some(document),
         canonical_patch: patch.map(|p| STANDARD.encode(p)),
     }
 }

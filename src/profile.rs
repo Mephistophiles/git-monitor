@@ -33,6 +33,7 @@ impl AnalysisProfile {
                 crate::hash(include_str!("../Cargo.lock")),
                 crate::hash(concat!(
                     include_str!("diff.rs"),
+                    include_str!("structural.rs"),
                     include_str!("git.rs"),
                     include_str!("model.rs"),
                     include_str!("document.rs"),

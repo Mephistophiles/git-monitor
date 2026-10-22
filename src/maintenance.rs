@@ -134,6 +134,11 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
             cfg.maintenance.cache_items,
             cfg.maintenance.cache_bytes,
         )?;
+        crate::cache::prune(
+            &git.path.join("git-monitor-syntax-cache"),
+            cfg.maintenance.cache_items,
+            cfg.maintenance.cache_bytes,
+        )?;
         if gc {
             git.raw(&["commit-graph", "write", "--reachable"])?;
             git.raw(&["repack", "-ad"])?;
