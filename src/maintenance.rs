@@ -68,6 +68,7 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
         "DELETE FROM cache WHERE key NOT IN (SELECT key FROM cache ORDER BY rowid DESC LIMIT ?)",
         [cfg.maintenance.cache_items as u64],
     )?;
+    tx.execute("DELETE FROM cache WHERE rowid IN (SELECT rowid FROM (SELECT rowid,SUM(length(body)) OVER(ORDER BY rowid DESC) AS bytes FROM cache) WHERE bytes>?)",[cfg.maintenance.cache_bytes])?;
     tx.commit()?;
     let mut roots: BTreeMap<std::path::PathBuf, BTreeSet<String>> = BTreeMap::new();
     for entry in std::fs::read_dir(&cfg.storage.repositories_dir)? {
@@ -127,6 +128,11 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
         }
         input.push_str("prepare\ncommit\n");
         git.raw_input(&["update-ref", "--stdin"], input.into_bytes())?;
+        crate::cache::prune(
+            &git.path.join("git-monitor-cache"),
+            cfg.maintenance.cache_items,
+            cfg.maintenance.cache_bytes,
+        )?;
         if gc {
             git.raw(&["commit-graph", "write", "--reachable"])?;
             git.raw(&["repack", "-ad"])?;
@@ -148,6 +154,11 @@ pub fn run(cfg: &Config, store: &mut Store, shutdown: &Shutdown, gc: bool) -> Re
             }
         }
     }
+    crate::cache::prune(
+        &cfg.storage.state_dir.join("render-cache"),
+        cfg.maintenance.cache_items,
+        cfg.maintenance.cache_bytes,
+    )?;
     let files = clean(
         &artifacts,
         cfg.maintenance.artifact_days.saturating_mul(86400),

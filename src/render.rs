@@ -67,7 +67,29 @@ fn row(r: &Row, split: bool) -> String {
         out
     }
 }
+thread_local! {static CACHE:std::cell::RefCell<Option<std::path::PathBuf>>=const{std::cell::RefCell::new(None)};}
+pub fn set_cache(path: Option<std::path::PathBuf>) {
+    CACHE.with(|s| *s.borrow_mut() = path);
+}
 fn file(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
+    let key = crate::hash(serde_json::to_vec(&(crate::profile::render_key(), f, config)).unwrap());
+    let directory = CACHE.with(|s| s.borrow().clone());
+    if let Some(directory) = &directory {
+        if let Some(bytes) = crate::cache::get(directory, &key, 256_000_000) {
+            if let Ok(html) = String::from_utf8(bytes) {
+                crate::metrics::update(|s| s.render_cache_hits += 1);
+                return html.replace("id=\"file-0\"", &format!("id=\"file-{index}\""));
+            }
+        }
+    }
+    let html = file_uncached(f, 0, config);
+    crate::metrics::update(|s| s.renders += 1);
+    if let Some(directory) = directory {
+        let _ = crate::cache::put(&directory, &key, html.as_bytes());
+    }
+    html.replace("id=\"file-0\"", &format!("id=\"file-{index}\""))
+}
+fn file_uncached(f: &FileDiff, index: usize, config: &DiffConfig) -> String {
     let adds = f
         .rows
         .iter()

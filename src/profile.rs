@@ -27,17 +27,24 @@ impl AnalysisProfile {
             let _ = GIT.set(version.clone());
             version
         };
+        static BUILD: OnceLock<(String, String)> = OnceLock::new();
+        let build = BUILD.get_or_init(|| {
+            (
+                crate::hash(include_str!("../Cargo.lock")),
+                crate::hash(concat!(
+                    include_str!("diff.rs"),
+                    include_str!("git.rs"),
+                    include_str!("model.rs"),
+                    include_str!("document.rs"),
+                    include_str!("config.rs"),
+                    include_str!("monitor.rs")
+                )),
+            )
+        });
         Ok(Self {
             git,
-            dependencies: crate::hash(include_str!("../Cargo.lock")),
-            analyzer: crate::hash(concat!(
-                include_str!("diff.rs"),
-                include_str!("git.rs"),
-                include_str!("model.rs"),
-                include_str!("document.rs"),
-                include_str!("config.rs"),
-                include_str!("monitor.rs")
-            )),
+            dependencies: build.0.clone(),
+            analyzer: build.1.clone(),
             model: MODEL_VERSION,
             drivers: drivers.clone(),
         })

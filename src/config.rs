@@ -30,6 +30,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Maintenance {
+    pub cache_bytes: u64,
     pub cache_items: usize,
     pub history_days: u64,
     pub artifact_days: u64,
@@ -38,6 +39,7 @@ pub struct Maintenance {
 impl Default for Maintenance {
     fn default() -> Self {
         Self {
+            cache_bytes: 1_000_000_000,
             cache_items: 10000,
             history_days: 90,
             artifact_days: 30,

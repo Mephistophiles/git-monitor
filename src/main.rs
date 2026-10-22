@@ -202,6 +202,8 @@ fn entry() -> Result<()> {
                     0
                 };
                 println!("events={events} analyses={analyses} queued={queued} sent={sent} fetch_failures={failures}");
+                store.record_metrics("pass", &git_monitor::metrics::snapshot())?;
+                git_monitor::metrics::log("pass");
                 if once || shutdown.requested() {
                     if failures > 0 && !shutdown.requested() {
                         anyhow::bail!(

@@ -197,6 +197,13 @@ fn selected(
             files.push(fd);
         }
     } else {
+        let oids = changes
+            .iter()
+            .filter(|c| w.path_matches(&c.path) && c.old_mode != "160000" && c.new_mode != "160000")
+            .flat_map(|c| c.old_blob.iter().chain(&c.new_blob))
+            .cloned()
+            .collect();
+        git.prefetch_blobs(&oids)?;
         for change in changes.iter().filter(|f| {
             w.path_matches(&f.path)
                 && task
@@ -538,7 +545,11 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
             &task.diff,
             &task.limits,
         ))?);
-        if let Some(result) = store.cache(&key)? {
+        if let Some(result) = store
+            .cache(&key)?
+            .filter(|_| cfg.execution.share_computations)
+        {
+            crate::metrics::update(|s| s.analysis_cache_hits += 1);
             store.finish_job(id, &task, &key, &result, None, cfg)?;
             continue;
         }
@@ -563,6 +574,7 @@ pub fn process_jobs(cfg: &Config, store: &mut Store, shutdown: &Shutdown) -> Res
             Some(cfg.limits.max_worker_address_space_bytes),
         );
         analyses += 1;
+        crate::metrics::update(|s| s.analyses += 1);
         let result = run.and_then(|o| {
             ensure!(
                 o.code == 0,

@@ -206,3 +206,5 @@ checks without contacting configured remotes or SMTP.
 This implementation follows [ARCHITECTURE.md](ARCHITECTURE.md). Fetch and analysis are currently serialized. `new_branch_mode = "summary"` is supported; comparison against a configured branch base is not. Whole-file and function patches use Git histogram. Reports use UTF-8 paths; unsupported path encodings fail visibly rather than being silently ignored. Maintenance is explicit or externally scheduled.
 
 Licensed under [MIT](LICENSE).
+
+Immutable analysis inputs use a checksummed disk cache keyed by the frozen Git/lockfile/analyzer profile. Ref reads and network operations remain live. Blob reads are batched within object/output budgets; function selections and HTML file fragments have separate cache identities. `execution.share_computations=false` disables reuse for comparison with a naive run. `maintenance.cache_items` and `maintenance.cache_bytes` bound disposable caches. Operation counters and cumulative waited-child CPU/max RSS are recorded separately from timing claims.

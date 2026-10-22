@@ -105,6 +105,12 @@ fn run_inner(
     memory: Option<u64>,
     input: Option<Vec<u8>>,
 ) -> Result<Output> {
+    if std::path::Path::new(command.get_program())
+        .file_name()
+        .is_some_and(|p| p == "git")
+    {
+        crate::metrics::update(|s| s.git_processes += 1);
+    }
     let group = std::env::var_os("GIT_MONITOR_WORKER").is_none();
     command
         .stdin(if input.is_some() {

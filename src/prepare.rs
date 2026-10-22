@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub render_cache: Option<std::path::PathBuf>,
     pub report: Report,
     pub diff: DiffConfig,
     pub limits: Limits,
@@ -20,6 +22,8 @@ pub struct Task {
 }
 #[derive(Serialize, Deserialize)]
 pub struct Prepared {
+    #[serde(default)]
+    pub counters: crate::metrics::Counters,
     pub html: String,
     pub parts: Vec<(String, Vec<u8>, String)>,
 }
@@ -39,6 +43,7 @@ fn dummy_mail(from: String) -> MailConfig {
     }
 }
 pub fn execute(task: &Task) -> Result<Prepared> {
+    render::set_cache(task.render_cache.clone());
     let mut parts = vec![];
     if let (Some(recipient), Some(from)) = (&task.recipient, &task.from) {
         let config = Config {
@@ -62,6 +67,7 @@ pub fn execute(task: &Task) -> Result<Prepared> {
         parts = mail::package(&task.report, recipient, &dummy_mail(from.clone()), &config)?;
     }
     Ok(Prepared {
+        counters: crate::metrics::snapshot(),
         html: render::html(&task.report, &task.diff),
         parts,
     })
@@ -74,6 +80,10 @@ pub fn bounded(
     shutdown: &Shutdown,
 ) -> Result<Prepared> {
     let task = Task {
+        render_cache: cfg
+            .execution
+            .share_computations
+            .then(|| cfg.storage.state_dir.join("render-cache")),
         report: report.clone(),
         diff: cfg.diff.clone(),
         limits: cfg.limits.clone(),

@@ -92,6 +92,8 @@ pub struct Task {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Analysis {
+    #[serde(default)]
+    pub counters: crate::metrics::Counters,
     pub commits: Vec<CommitView>,
     pub files: Vec<FileDiff>,
     pub outgoing: Vec<String>,
@@ -145,6 +147,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS active_sources(repository TEXT NOT NULL, remote TEXT NOT NULL, identity TEXT NOT NULL, key TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(repository,remote));
           CREATE TABLE IF NOT EXISTS maintenance_log(id INTEGER PRIMARY KEY,body TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS delivery_times(digest TEXT PRIMARY KEY,created INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS stage_metrics(id INTEGER PRIMARY KEY,stage TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL);
           PRAGMA user_version=3; COMMIT;")?;
         db.execute(
             "INSERT OR IGNORE INTO delivery_times SELECT DISTINCT digest,? FROM deliveries",
@@ -449,7 +452,7 @@ impl Store {
                 && w.repository == event.repository
         });
         let tx = self.db.transaction()?;
-        if error.is_none() {
+        if error.is_none() && cfg.execution.share_computations {
             tx.execute(
                 "INSERT OR IGNORE INTO cache(key,body) VALUES(?,?)",
                 params![key, serde_json::to_string(result)?],
@@ -569,6 +572,14 @@ impl Store {
             ));
         }
         Ok(out)
+    }
+    pub fn record_metrics(&self, stage: &str, counters: &crate::metrics::Counters) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO stage_metrics(stage,created,body) VALUES(?,?,?)",
+            params![stage, crate::now(), serde_json::to_string(counters)?],
+        )?;
+        self.db.execute("DELETE FROM stage_metrics WHERE id NOT IN (SELECT id FROM stage_metrics ORDER BY id DESC LIMIT 1000)",[])?;
+        Ok(())
     }
     pub fn retry_job(&self, id: i64) -> Result<()> {
         ensure!(
